@@ -212,6 +212,9 @@ export class ChatServer {
       case 'hub.update':
         this.handleHubUpdate(connectionId, msg)
         break
+      case 'hub.delete':
+        this.handleHubDelete(connectionId, msg)
+        break
       case 'channel.list':
         this.handleChannelList(connectionId, msg)
         break
@@ -220,6 +223,9 @@ export class ChatServer {
         break
       case 'channel.update':
         this.handleChannelUpdate(connectionId, msg)
+        break
+      case 'channel.delete':
+        this.handleChannelDelete(connectionId, msg)
         break
       case 'channel.join':
         this.handleChannelJoin(connectionId, msg)
@@ -387,6 +393,11 @@ export class ChatServer {
       ok: true,
       body: { hub }
     })
+    // Broadcast to all hub members (should just be the creator at creation, but covers future-proofing)
+    this.broadcastHub(hub.hub_id, {
+      t: 'hub.created',
+      body: { hub }
+    })
   }
 
   handleHubUpdate(connectionId, msg) {
@@ -413,21 +424,109 @@ export class ChatServer {
     })
   }
 
+  handleHubDelete(connectionId, msg) {
+    const connection = this.connections.get(connectionId)
+    const user = this.authService.getUser(connection.userId)
+    const { hub_id } = msg.body || {}
+    const audienceConnectionIds = this.getHubAudienceConnectionIds(hub_id)
+    const result = this.hubService.deleteHub({
+      hubId: hub_id,
+      userId: connection.userId,
+      roles: user?.roles || []
+    })
+
+    this.send(connectionId, {
+      t: 'hub.deleted',
+      reply_to: msg.id,
+      ok: true,
+      body: result
+    })
+
+    for (const audienceConnectionId of audienceConnectionIds) {
+      if (audienceConnectionId === connectionId) {
+        continue
+      }
+      this.send(audienceConnectionId, {
+        t: 'hub.deleted',
+        ok: true,
+        body: result
+      })
+    }
+  }
+
   /**
-   * Broadcast a message to all members of a hub
+   * Broadcast a hub message to all authenticated clients who can access this hub
    * @param {string} hubId
    * @param {Object} payload
    */
   broadcastHub(hubId, payload) {
-    // Find all members of the hub
-    const members = this.hubService.db.prepare('SELECT user_id FROM hub_members WHERE hub_id = ? AND left_at IS NULL').all(hubId)
-    for (const member of members) {
-      const connectionIds = this.userConnections.get(member.user_id)
-      if (!connectionIds) continue
-      for (const connectionId of connectionIds) {
+    const hub = this.hubService.getHub(hubId)
+    if (!hub || hub.deleted_at) {
+      return
+    }
+
+    const rolesByUserId = new Map()
+    for (const [connectionId, connection] of this.connections.entries()) {
+      if (!connection.userId) {
+        continue
+      }
+
+      if (!rolesByUserId.has(connection.userId)) {
+        const user = this.authService.getUser(connection.userId)
+        rolesByUserId.set(connection.userId, user?.roles || [])
+      }
+
+      const roles = rolesByUserId.get(connection.userId)
+      if (this.hubService.canAccessHub(hubId, connection.userId, roles)) {
         this.send(connectionId, payload)
       }
     }
+  }
+
+  getHubAudienceConnectionIds(hubId) {
+    const audience = []
+    const rolesByUserId = new Map()
+
+    for (const [connectionId, connection] of this.connections.entries()) {
+      if (!connection.userId) {
+        continue
+      }
+
+      if (!rolesByUserId.has(connection.userId)) {
+        const user = this.authService.getUser(connection.userId)
+        rolesByUserId.set(connection.userId, user?.roles || [])
+      }
+
+      const roles = rolesByUserId.get(connection.userId)
+      if (this.hubService.canAccessHub(hubId, connection.userId, roles)) {
+        audience.push(connectionId)
+      }
+    }
+
+    return audience
+  }
+
+  getChannelAudienceConnectionIds(channelId) {
+    const audience = []
+    const rolesByUserId = new Map()
+
+    for (const [connectionId, connection] of this.connections.entries()) {
+      if (!connection.userId) {
+        continue
+      }
+
+      if (!rolesByUserId.has(connection.userId)) {
+        const user = this.authService.getUser(connection.userId)
+        rolesByUserId.set(connection.userId, user?.roles || [])
+      }
+
+      const roles = rolesByUserId.get(connection.userId)
+      if (this.channelService.canAccessChannel(channelId, connection.userId, roles)) {
+        audience.push(connectionId)
+      }
+    }
+
+    return audience
   }
 
   handleChannelList(connectionId, msg) {
@@ -470,6 +569,17 @@ export class ChatServer {
       ok: true,
       body: { channel }
     })
+    const audienceConnectionIds = this.getChannelAudienceConnectionIds(channel.channel_id)
+    for (const audienceConnectionId of audienceConnectionIds) {
+      if (audienceConnectionId === connectionId) {
+        continue
+      }
+      this.send(audienceConnectionId, {
+        t: 'channel.created',
+        ok: true,
+        body: { channel }
+      })
+    }
   }
 
   handleChannelUpdate(connectionId, msg) {
@@ -489,11 +599,47 @@ export class ChatServer {
       ok: true,
       body: { channel }
     })
-    // Broadcast to all channel members
-    this.broadcastChannel(channel_id, {
-      t: 'channel.updated',
-      body: { channel }
+    const audienceConnectionIds = this.getChannelAudienceConnectionIds(channel.channel_id)
+    for (const audienceConnectionId of audienceConnectionIds) {
+      if (audienceConnectionId === connectionId) {
+        continue
+      }
+      this.send(audienceConnectionId, {
+        t: 'channel.updated',
+        ok: true,
+        body: { channel }
+      })
+    }
+  }
+
+  handleChannelDelete(connectionId, msg) {
+    const connection = this.connections.get(connectionId)
+    const user = this.authService.getUser(connection.userId)
+    const { channel_id } = msg.body || {}
+    const audienceConnectionIds = this.getChannelAudienceConnectionIds(channel_id)
+    const result = this.channelService.deleteChannel({
+      channelId: channel_id,
+      userId: connection.userId,
+      roles: user?.roles || []
     })
+
+    this.send(connectionId, {
+      t: 'channel.deleted',
+      reply_to: msg.id,
+      ok: true,
+      body: result
+    })
+
+    for (const audienceConnectionId of audienceConnectionIds) {
+      if (audienceConnectionId === connectionId) {
+        continue
+      }
+      this.send(audienceConnectionId, {
+        t: 'channel.deleted',
+        ok: true,
+        body: result
+      })
+    }
   }
 
   handleChannelJoin(connectionId, msg) {

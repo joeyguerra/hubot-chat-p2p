@@ -244,4 +244,42 @@ export class HubService {
     // Return updated hub
     return this.getHub(hubId)
   }
+
+  /**
+   * Soft-delete a hub and all channels inside it
+   * @param {Object} params
+   * @param {string} params.hubId - Hub ID
+   * @param {string} params.userId - User ID making the delete request
+   * @param {Array<string>} params.roles - User roles
+   * @returns {{ hub_id: string, channel_ids: Array<string> }}
+   */
+  deleteHub({ hubId, userId, roles = [] }) {
+    const hub = this.getHub(hubId)
+    if (!hub || hub.deleted_at) {
+      throw new ServiceError('NOT_FOUND', 'Hub not found')
+    }
+
+    const isAdmin = roles.includes('admin')
+    const isCreator = hub.created_by_user_id === userId
+    if (!isAdmin && !isCreator) {
+      throw new ServiceError('FORBIDDEN', 'Cannot delete hub')
+    }
+
+    const now = this.nowFn()
+    const activeChannelRows = this.db.prepare(
+      `
+        SELECT channel_id
+        FROM channels
+        WHERE hub_id = ? AND deleted_at IS NULL
+      `
+    ).all(hubId)
+    const channelIds = activeChannelRows.map((row) => row.channel_id)
+
+    runTransaction(this.db, () => {
+      this.db.prepare('UPDATE hubs SET deleted_at = ? WHERE hub_id = ?').run(now, hubId)
+      this.db.prepare('UPDATE channels SET deleted_at = ? WHERE hub_id = ? AND deleted_at IS NULL').run(now, hubId)
+    })
+
+    return { hub_id: hubId, channel_ids: channelIds }
+  }
 }

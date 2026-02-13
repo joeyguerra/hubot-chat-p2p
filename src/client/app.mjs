@@ -304,10 +304,13 @@ const messageHandlers = {
     renderHubs()
   },
   'hub.created': (msg) => {
-    state.hubs.push(msg.body.hub)
-    showToast(`Hub "${msg.body.hub.name}" created successfully`)
-    dom.createHubModal.close()
-    renderHubs()
+    const exists = state.hubs.some(h => h.hub_id === msg.body.hub.hub_id)
+    if (!exists) {
+      state.hubs.push(msg.body.hub)
+      showToast(`Hub "${msg.body.hub.name}" created successfully`)
+      if (dom.createHubModal && dom.createHubModal.close) dom.createHubModal.close()
+      renderHubs()
+    }
   },
   'hub.updated': (msg) => {
     const hubIndex = state.hubs.findIndex(h => h.hub_id === msg.body.hub.hub_id)
@@ -316,6 +319,10 @@ const messageHandlers = {
       renderHubs()
       showToast(`Hub renamed to "${msg.body.hub.name}"`)
     }
+  },
+  'hub.deleted': (msg) => {
+    applyHubDeleted(msg.body || {})
+    showToast('Hub deleted')
   },
   'channel.list_result': (msg) => {
     state.channels = msg.body.channels || []
@@ -335,10 +342,16 @@ const messageHandlers = {
     }
   },
   'channel.created': (msg) => {
-    state.channels.push(msg.body.channel)
-    renderChannels()
-    setActiveChannel(msg.body.channel.channel_id)
-    send('channel.join', { channel_id: msg.body.channel.channel_id })
+    const exists = state.channels.some(c => c.channel_id === msg.body.channel.channel_id)
+    if (!exists) {
+      state.channels.push(msg.body.channel)
+      renderChannels()
+      // Only auto-activate when this client created the channel (reply_to present).
+      if (msg.reply_to) {
+        setActiveChannel(msg.body.channel.channel_id)
+        send('channel.join', { channel_id: msg.body.channel.channel_id })
+      }
+    }
   },
   'channel.updated': (msg) => {
     const channelIndex = state.channels.findIndex(c => c.channel_id === msg.body.channel.channel_id)
@@ -350,6 +363,10 @@ const messageHandlers = {
       }
       showToast(`Channel renamed to "${msg.body.channel.name}"`)
     }
+  },
+  'channel.deleted': (msg) => {
+    applyChannelDeleted(msg.body || {})
+    showToast('Channel deleted')
   },
   'channel.added': (msg) => {
     const existingChannel = state.channels.find(c => c.channel_id === msg.body.channel_id)
@@ -443,6 +460,72 @@ const requestChannels = () => {
   send('channel.list', {})
 }
 
+/**
+ * Apply local state updates after a hub is deleted
+ * @param {{hub_id?: string}} body
+ */
+const applyHubDeleted = (body) => {
+  const hubId = body.hub_id
+  if (!hubId) {
+    return
+  }
+
+  const removedChannelIds = new Set(
+    state.channels.filter((channel) => channel.hub_id === hubId).map((channel) => channel.channel_id)
+  )
+
+  state.hubs = state.hubs.filter((hub) => hub.hub_id !== hubId)
+  state.channels = state.channels.filter((channel) => channel.hub_id !== hubId)
+
+  for (const channelId of removedChannelIds) {
+    state.messages.delete(channelId)
+    localStorage.removeItem(`channel:${channelId}:messages`)
+  }
+
+  if (state.currentChannelId && removedChannelIds.has(state.currentChannelId)) {
+    const nextChannelId = state.channels[0]?.channel_id || null
+    state.currentChannelId = null
+    if (nextChannelId) {
+      setActiveChannel(nextChannelId)
+    } else {
+      dom.activeRoom.textContent = 'No channel selected'
+      dom.messages.innerHTML = ''
+      updateCallControls()
+    }
+  }
+
+  renderChannels()
+}
+
+/**
+ * Apply local state updates after a channel is deleted
+ * @param {{channel_id?: string}} body
+ */
+const applyChannelDeleted = (body) => {
+  const channelId = body.channel_id
+  if (!channelId) {
+    return
+  }
+
+  state.channels = state.channels.filter((channel) => channel.channel_id !== channelId)
+  state.messages.delete(channelId)
+  localStorage.removeItem(`channel:${channelId}:messages`)
+
+  if (state.currentChannelId === channelId) {
+    const nextChannelId = state.channels[0]?.channel_id || null
+    state.currentChannelId = null
+    if (nextChannelId) {
+      setActiveChannel(nextChannelId)
+    } else {
+      dom.activeRoom.textContent = 'No channel selected'
+      dom.messages.innerHTML = ''
+      updateCallControls()
+    }
+  }
+
+  renderChannels()
+}
+
 // Channel creation modal listeners (hoisted for use in renderHubs)
 function openCreateRoomModal(hubId = null) {
   state.selectedHubIdForChannelCreation = hubId
@@ -512,9 +595,28 @@ const renderHubs = () => {
       e.stopPropagation()
       openCreateRoomModal(hub.hub_id)
     })
+
+    const deleteHubBtn = document.createElement('button')
+    deleteHubBtn.className = 'add-channel-btn delete-btn'
+    deleteHubBtn.textContent = '🗑'
+    deleteHubBtn.title = `Delete hub ${hub.name}`
+    deleteHubBtn.setAttribute('aria-label', `Delete hub ${hub.name}`)
+    deleteHubBtn.addEventListener('click', (e) => {
+      e.stopPropagation()
+      const confirmed = window.confirm(`Delete hub "${hub.name}" and all its channels?`)
+      if (!confirmed) {
+        return
+      }
+      send('hub.delete', { hub_id: hub.hub_id })
+    })
+
+    const hubActions = document.createElement('div')
+    hubActions.className = 'hub-actions'
+    hubActions.appendChild(addChannelBtn)
+    hubActions.appendChild(deleteHubBtn)
     
     hubHeader.appendChild(hubName)
-    hubHeader.appendChild(addChannelBtn)
+    hubHeader.appendChild(hubActions)
     hubItem.appendChild(hubHeader)
     
     // Get channels for this hub
@@ -559,7 +661,21 @@ const renderHubs = () => {
           }
           startEditingChannelName(channel, channelName, icon)
         })
+        const deleteChannelBtn = document.createElement('button')
+        deleteChannelBtn.className = 'channel-delete-btn'
+        deleteChannelBtn.textContent = '🗑'
+        deleteChannelBtn.title = `Delete channel ${channel.name}`
+        deleteChannelBtn.setAttribute('aria-label', `Delete channel ${channel.name}`)
+        deleteChannelBtn.addEventListener('click', (e) => {
+          e.stopPropagation()
+          const confirmed = window.confirm(`Delete channel "${channel.name}"?`)
+          if (!confirmed) {
+            return
+          }
+          send('channel.delete', { channel_id: channel.channel_id })
+        })
         channelItem.appendChild(channelName)
+        channelItem.appendChild(deleteChannelBtn)
         channelsList.appendChild(channelItem)
       })
       
@@ -1354,5 +1470,3 @@ const setupEventListeners = () => {
 setupEventListeners()
 updateCallControls()
 connect()
-
-

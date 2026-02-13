@@ -167,6 +167,34 @@ export class ChannelService {
     return !!member && !member.left_at && !member.banned_at
   }
 
+  /**
+   * Check if user can access a channel
+   * @param {string} channelId - Channel ID
+   * @param {string} userId - User ID
+   * @param {Array<string>} roles - User roles
+   * @returns {boolean}
+   */
+  canAccessChannel(channelId, userId, roles = []) {
+    if (roles.includes('admin')) {
+      return true
+    }
+
+    const channel = this.getChannel(channelId)
+    if (!channel || channel.deleted_at) {
+      return false
+    }
+
+    if (!this.hubService.canAccessHub(channel.hub_id, userId, roles)) {
+      return false
+    }
+
+    if (channel.visibility === 'public') {
+      return true
+    }
+
+    return this.isMember(channelId, userId)
+  }
+
   listChannelMembers(channelId) {
     return this.db.prepare(
       `
@@ -344,5 +372,36 @@ export class ChannelService {
 
     // Return updated channel
     return this.getChannel(channelId)
+  }
+
+  /**
+   * Soft-delete a channel
+   * @param {Object} params
+   * @param {string} params.channelId - Channel ID
+   * @param {string} params.userId - User ID making the delete request
+   * @param {Array<string>} params.roles - User roles
+   * @returns {Object} Deleted channel metadata
+   */
+  deleteChannel({ channelId, userId, roles = [] }) {
+    const channel = this.getChannel(channelId)
+    if (!channel || channel.deleted_at) {
+      throw new ServiceError('NOT_FOUND', 'Channel not found')
+    }
+
+    const isAdmin = roles.includes('admin')
+    const isCreator = channel.created_by_user_id === userId
+    const membership = this.getMembership(channelId, userId)
+    const isOwner = membership && membership.role === 'owner' && !membership.left_at && !membership.banned_at
+    if (!isAdmin && !isCreator && !isOwner) {
+      throw new ServiceError('FORBIDDEN', 'Cannot delete channel')
+    }
+
+    const now = this.nowFn()
+    this.db.prepare('UPDATE channels SET deleted_at = ? WHERE channel_id = ?').run(now, channelId)
+
+    return {
+      channel_id: channel.channel_id,
+      hub_id: channel.hub_id
+    }
   }
 }
