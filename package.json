@@ -1,0 +1,15 @@
+{
+  "name": "hubot-chat-p2p",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "A small local-first P2P chat built on Hubot",
+  "scripts": {
+    "start": "node --watch src/server/index.mjs",
+    "test": "node --test",
+    "smoke": "node scripts/smoke.mjs"
+  },
+  "dependencies": {
+    "ws": "^8.17.0"
+  }
+}
