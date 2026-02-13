@@ -14,6 +14,16 @@ export class SignalingService {
   }
 
   createCall({ roomId, createdByUserId, topology = 'mesh' }) {
+    for (const existingCall of this.calls.values()) {
+      if (existingCall.room_id === roomId) {
+        return {
+          call_id: existingCall.call_id,
+          room_id: existingCall.room_id,
+          topology: existingCall.topology
+        }
+      }
+    }
+
     const callId = newId('call')
     this.calls.set(callId, {
       call_id: callId,
@@ -40,14 +50,16 @@ export class SignalingService {
   leaveCall({ callId, peerId }) {
     const call = this.calls.get(callId)
     if (!call) {
-      return { removed: false, peers: [] }
+      return { removed: false, peers: [], ended: false, room_id: null }
     }
     const removed = call.peers.delete(peerId)
     const peers = Array.from(call.peers.values()).map((peer) => ({ peer_id: peer.peer_id, user_id: peer.user_id }))
+    const roomId = call.room_id
+    const ended = call.peers.size === 0
     if (call.peers.size === 0) {
       this.calls.delete(callId)
     }
-    return { removed, peers }
+    return { removed, peers, ended, room_id: roomId }
   }
 
   endCall({ callId }) {

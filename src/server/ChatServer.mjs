@@ -1,4 +1,5 @@
 import http from 'node:http'
+import https from 'node:https'
 import fs from 'node:fs'
 import path from 'node:path'
 import { WebSocketServer } from 'ws'
@@ -26,7 +27,7 @@ const contentTypeFor = (filePath) => {
 }
 
 export class ChatServer {
-  constructor({ db, logger }) {
+  constructor({ db, logger, tls = null }) {
     this.db = db
     this.logger = logger
     this.authService = new AuthService({
@@ -46,7 +47,9 @@ export class ChatServer {
     this.userConnections = new Map()
     this.peerConnections = new Map()
 
-    this.httpServer = http.createServer(this.handleHttp.bind(this))
+    this.httpServer = tls
+      ? https.createServer(tls, this.handleHttp.bind(this))
+      : http.createServer(this.handleHttp.bind(this))
     this.wsServer = new WebSocketServer({ server: this.httpServer, path: '/ws' })
 
     this.wsServer.on('connection', (ws) => this.handleConnection(ws))
@@ -85,7 +88,8 @@ export class ChatServer {
   }
 
   handleHttp(req, res) {
-    const url = new URL(req.url || '/', `http://${req.headers.host}`)
+    const protocol = req.socket.encrypted ? 'https' : 'http'
+    const url = new URL(req.url || '/', `${protocol}://${req.headers.host}`)
     let filePath = path.join(CLIENT_ROOT, url.pathname)
     if (url.pathname === '/') {
       filePath = path.join(CLIENT_ROOT, 'index.html')
@@ -139,6 +143,16 @@ export class ChatServer {
             call_id: connection.callId,
             kind: 'leave',
             peer: { peer_id: connection.peerId, user_id: connection.userId }
+          }
+        })
+      }
+      if (result.ended && result.room_id) {
+        this.broadcastChannel(result.room_id, {
+          t: 'rtc.call_end',
+          ok: true,
+          body: {
+            call_id: connection.callId,
+            channel_id: result.room_id
           }
         })
       }
@@ -948,6 +962,7 @@ export class ChatServer {
     this.validateSignalingSize(msg)
     const connection = this.connections.get(connectionId)
     const { call_id, to_peer_id, from_peer_id, sdp } = msg.body || {}
+    this.validateSdp(sdp)
     this.ensurePeerMatch(connection, from_peer_id, call_id)
     this.signalingService.routeOffer({ callId: call_id, fromPeerId: from_peer_id, toPeerId: to_peer_id, sdp })
   }
@@ -956,6 +971,7 @@ export class ChatServer {
     this.validateSignalingSize(msg)
     const connection = this.connections.get(connectionId)
     const { call_id, to_peer_id, from_peer_id, sdp } = msg.body || {}
+    this.validateSdp(sdp)
     this.ensurePeerMatch(connection, from_peer_id, call_id)
     this.signalingService.routeAnswer({ callId: call_id, fromPeerId: from_peer_id, toPeerId: to_peer_id, sdp })
   }
@@ -1004,6 +1020,16 @@ export class ChatServer {
         }
       })
     }
+    if (result.ended && result.room_id) {
+      this.broadcastChannel(result.room_id, {
+        t: 'rtc.call_end',
+        ok: true,
+        body: {
+          call_id,
+          channel_id: result.room_id
+        }
+      })
+    }
   }
 
   handleRtcEndCall(connectionId, msg) {
@@ -1028,6 +1054,20 @@ export class ChatServer {
     for (const peer of ended.peers) {
       const connId = this.peerConnections.get(peer.peer_id)
       if (connId) {
+        this.send(connId, {
+          t: 'rtc.call_end',
+          ok: true,
+          body: {
+            call_id,
+            channel_id: ended.room_id
+          }
+        })
+      }
+    }
+
+    for (const peer of ended.peers) {
+      const connId = this.peerConnections.get(peer.peer_id)
+      if (connId) {
         const conn = this.connections.get(connId)
         if (conn) {
           conn.peerId = null
@@ -1037,7 +1077,7 @@ export class ChatServer {
       this.peerConnections.delete(peer.peer_id)
     }
 
-    this.broadcastCall(call_id, {
+    this.broadcastChannel(ended.room_id, {
       t: 'rtc.call_end',
       ok: true,
       body: {
@@ -1073,6 +1113,12 @@ export class ChatServer {
     const bodySize = Buffer.byteLength(JSON.stringify(msg.body || {}))
     if (bodySize > maxBytes) {
       throw new ServiceError('BAD_REQUEST', 'Signaling payload too large')
+    }
+  }
+
+  validateSdp(sdp) {
+    if (typeof sdp !== 'string' || !sdp.trim().startsWith('v=')) {
+      throw new ServiceError('BAD_REQUEST', 'Invalid SDP payload')
     }
   }
 

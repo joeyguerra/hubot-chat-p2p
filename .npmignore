@@ -4,3 +4,4 @@ tests/
 DESIGN_DOC.md
 docker-build-k3d.sh
 Dockerfile
+certs

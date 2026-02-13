@@ -9,7 +9,16 @@
   <body>
     <div class='app'>
       <header class='topbar'>
-        <div class='brand'>hubot chat p2p</div>
+        <div class='topbar-left'>
+          <button
+            id='mobile-menu-btn'
+            class='mobile-menu-btn'
+            aria-label='Toggle hubs and channels menu'
+            aria-controls='sidebar-menu'
+            aria-expanded='false'
+          >☰</button>
+          <div class='brand'>hubot chat p2p</div>
+        </div>
         <div class='topbar-right'>
           <div class='status' id='status'>disconnected</div>
           <div class='user-pill' id='user-pill'>signed out</div>
@@ -62,9 +71,10 @@
       </section>
 
       <div class='toast' id='toast'></div>
+      <div id='mobile-diagnostics' class='mobile-diagnostics' aria-live='polite'></div>
 
       <div class='layout'>
-        <aside class='card sidebar'>
+        <aside id='sidebar-menu' class='card sidebar'>
           <div class='section-title'>Hubs</div>
           <ul id='hubs-list' class='hubs-list'></ul>
           <div class='divider'></div>
@@ -79,6 +89,7 @@
           </div>
 
         </aside>
+        <button id='sidebar-overlay' class='sidebar-overlay' aria-label='Close hubs and channels menu'></button>
 
         <dialog id='create-hub-modal' class='modal'>
           <div class='modal-content'>
@@ -130,6 +141,13 @@
               <div class='form-group'>
                 <label for='modal-room-kind'>Channel type</label>
                 <select id='modal-room-kind'>
+                  <option value='text'>Text</option>
+                  <option value='voice'>Voice</option>
+                </select>
+              </div>
+              <div class='form-group'>
+                <label for='modal-room-visibility'>Visibility</label>
+                <select id='modal-room-visibility'>
                   <option value='public'>Public</option>
                   <option value='private'>Private</option>
                 </select>
@@ -168,29 +186,35 @@
               <div id='active-room' class='room-name'>None</div>
             </div>
             <div class='call-controls'>
-              <button id='start-call' class='primary'>Join voice</button>
-              <button id='toggle-media'>Start video</button>
-              <button id='share-screen'>Share screen</button>
+              <button id='start-call' class='icon-control voice-only' aria-label='Mute or unmute microphone' title='Mute or unmute microphone'>🎤</button>
+              <button id='toggle-media' class='icon-control voice-only' aria-label='Toggle camera' title='Toggle camera'>📷</button>
+              <button id='share-screen' class='icon-control voice-only' aria-label='Toggle screen share' title='Toggle screen share'>🖥</button>
+              <button id='hangup-call'>Hang up</button>
               <button id='add-member'>Add member</button>
             </div>
           </div>
-          <div class='voice-hint' id='voice-hint'>Join voice to enable video and screen share</div>
-          <div class='search-row'>
-            <input id='search-input' placeholder='Search this channel'>
-            <button id='search-btn'>Search</button>
-          </div>
-          <div id='search-results' class='search-results'></div>
-          <div id='messages' class='messages'></div>
-          <div class='composer'>
-            <textarea id='message-input' placeholder='Write a message' rows='2'></textarea>
-            <button id='send-message' class='primary'>Send</button>
-          </div>
+          <div class='voice-hint' id='voice-hint'>Select a voice channel to auto-join with your mic</div>
+          <div id='streams' class='streams media-stage'></div>
+          <div id='streams-empty' class='streams-empty'>No live streams yet</div>
+          <button id='text-chat-toggle' class='text-chat-toggle' aria-expanded='false' aria-controls='text-chat-drawer'><</button>
+          <section id='text-chat-drawer' class='card text-chat-drawer'>
+            <div class='drawer-header'>
+              <div class='section-title'>Text chat</div>
+              <button id='text-chat-close' class='icon-btn' aria-label='Close text chat'>×</button>
+            </div>
+            <div class='search-row'>
+              <input id='search-input' placeholder='Search this channel'>
+              <button id='search-btn'>Search</button>
+            </div>
+            <div id='search-results' class='search-results'></div>
+            <div id='messages' class='messages'></div>
+            <div class='composer'>
+              <textarea id='message-input' placeholder='Write a message' rows='2'></textarea>
+              <button id='send-message' class='primary'>Send</button>
+            </div>
+          </section>
         </section>
 
-        <section class='card media'>
-          <div class='section-title'>Streams</div>
-          <div id='streams' class='streams'></div>
-        </section>
       </div>
     </div>
 

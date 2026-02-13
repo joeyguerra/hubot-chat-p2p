@@ -21,9 +21,18 @@ const state = {
   videoStream: null,
   screenStream: null,
   streamTiles: new Map(),
+  remoteAudioEls: new Map(),
+  pendingIceByPeer: new Map(),
   channelCallMap: new Map(),
   toastTimer: null,
-  voiceActive: false
+  voiceActive: false,
+  sidebarMenuOpen: false,
+  micMuted: false,
+  textChatDrawerOpen: false,
+  reconnectTimer: null,
+  reconnectAttempts: 0,
+  lastSocketEvent: 'init',
+  lastSocketError: ''
 }
 
 /**
@@ -56,13 +65,22 @@ const dom = {
   signinBtn: qs('#signin-btn'),
   signinHint: qs('#signin-hint'),
   toast: qs('#toast'),
+  mobileDiagnostics: qs('#mobile-diagnostics'),
   layout: qs('.layout'),
+  chatCard: qs('.chat'),
+  mobileMenuBtn: qs('#mobile-menu-btn'),
+  sidebar: qs('#sidebar-menu'),
+  sidebarOverlay: qs('#sidebar-overlay'),
   adminPanel: qs('#admin-panel'),
   hubsList: qs('#hubs-list'),
   activeRoom: qs('#active-room'),
   messages: qs('#messages'),
   searchResults: qs('#search-results'),
   streams: qs('#streams'),
+  streamsEmpty: qs('#streams-empty'),
+  textChatToggle: qs('#text-chat-toggle'),
+  textChatClose: qs('#text-chat-close'),
+  textChatDrawer: qs('#text-chat-drawer'),
   adminInvite: qs('#admin-invite'),
   adminInviteSide: qs('#admin-invite-side'),
   createAdminInviteBtn: qs('#create-admin-invite'),
@@ -78,6 +96,7 @@ const dom = {
   startCallBtn: qs('#start-call'),
   toggleMediaBtn: qs('#toggle-media'),
   shareScreenBtn: qs('#share-screen'),
+  hangupCallBtn: qs('#hangup-call'),
   addMemberBtn: qs('#add-member'),
   voiceHint: qs('#voice-hint'),
   roomNameInput: qs('#room-name'),
@@ -88,6 +107,7 @@ const dom = {
   modalCreateRoomBtn: qs('#modal-create-room'),
   modalRoomName: qs('#modal-room-name'),
   modalRoomKind: qs('#modal-room-kind'),
+  modalRoomVisibility: qs('#modal-room-visibility'),
   modalHubSelect: qs('#modal-hub-select'),
   addMemberModal: qs('#add-member-modal'),
   closeAddMemberModalBtn: qs('#close-add-member-modal'),
@@ -100,12 +120,93 @@ const dom = {
   searchInput: qs('#search-input')
 }
 
+const MOBILE_SIDEBAR_BREAKPOINT = 900
+
+const isMobileViewport = () => window.innerWidth <= MOBILE_SIDEBAR_BREAKPOINT
+
+const syncSidebarMenuUi = () => {
+  if (!dom.mobileMenuBtn || !dom.sidebar || !dom.sidebarOverlay) {
+    return
+  }
+  dom.mobileMenuBtn.setAttribute('aria-expanded', state.sidebarMenuOpen ? 'true' : 'false')
+  dom.sidebar.classList.toggle('mobile-open', state.sidebarMenuOpen)
+  dom.sidebarOverlay.classList.toggle('show', state.sidebarMenuOpen)
+}
+
+const setSidebarMenuOpen = (isOpen) => {
+  if (!state.user || !isMobileViewport()) {
+    state.sidebarMenuOpen = false
+  } else {
+    state.sidebarMenuOpen = Boolean(isOpen)
+  }
+  syncSidebarMenuUi()
+}
+
+const getChannelById = (channelId) => state.channels.find((channel) => channel.channel_id === channelId) || null
+
+const isVoiceChannel = (channelId) => getChannelById(channelId)?.kind === 'voice'
+
+const syncTextChatDrawerUi = () => {
+  if (!dom.textChatToggle || !dom.textChatDrawer) {
+    return
+  }
+  dom.textChatToggle.textContent = state.textChatDrawerOpen ? '>' : '<'
+  dom.textChatToggle.setAttribute('aria-expanded', state.textChatDrawerOpen ? 'true' : 'false')
+  dom.textChatDrawer.classList.toggle('open', state.textChatDrawerOpen)
+}
+
+const setTextChatDrawerOpen = (isOpen) => {
+  state.textChatDrawerOpen = Boolean(isOpen)
+  syncTextChatDrawerUi()
+}
+
+const updateChannelLayoutMode = () => {
+  if (!dom.chatCard) {
+    return
+  }
+  const inVoiceChannel = isVoiceChannel(state.currentChannelId)
+  dom.chatCard.classList.toggle('voice-channel', inVoiceChannel)
+  dom.chatCard.classList.toggle('text-channel', !inVoiceChannel)
+  if (!inVoiceChannel) {
+    setTextChatDrawerOpen(false)
+  }
+}
+
 /**
  * Set connection status text
  * @param {string} text
  */
 const setStatus = (text) => {
   dom.status.textContent = text
+  renderMobileDiagnostics()
+}
+
+const wsReadyStateText = () => {
+  if (!state.ws) return 'none'
+  switch (state.ws.readyState) {
+    case WebSocket.CONNECTING: return 'connecting'
+    case WebSocket.OPEN: return 'open'
+    case WebSocket.CLOSING: return 'closing'
+    case WebSocket.CLOSED: return 'closed'
+    default: return 'unknown'
+  }
+}
+
+const renderMobileDiagnostics = () => {
+  if (!dom.mobileDiagnostics) {
+    return
+  }
+  const protocol = location.protocol === 'https:' ? 'wss' : 'ws'
+  const wsUrl = `${protocol}://${location.host}/ws`
+  dom.mobileDiagnostics.textContent = [
+    `page: ${location.href}`,
+    `secureContext: ${window.isSecureContext}`,
+    `ws: ${wsReadyStateText()}`,
+    `url: ${wsUrl}`,
+    `event: ${state.lastSocketEvent || '-'}`,
+    `retries: ${state.reconnectAttempts}`,
+    state.lastSocketError ? `error: ${state.lastSocketError}` : ''
+  ].filter(Boolean).join('\n')
 }
 
 /**
@@ -135,6 +236,8 @@ const setAuthUi = () => {
     } else {
       dom.adminPanel.classList.add('hidden')
     }
+    setSidebarMenuOpen(false)
+    setTextChatDrawerOpen(false)
     showToast('Signed in. Create a channel or invite someone')
   } else {
     dom.userPill.textContent = 'signed out'
@@ -142,7 +245,10 @@ const setAuthUi = () => {
     dom.authCard.classList.remove('hidden')
     dom.layout.classList.add('hidden')
     dom.adminPanel.classList.add('hidden')
+    setSidebarMenuOpen(false)
+    setTextChatDrawerOpen(false)
   }
+  updateChannelLayoutMode()
 }
 
 /**
@@ -161,14 +267,42 @@ const send = (messageType, body) => {
   state.ws.send(JSON.stringify({ v: 1, t: messageType, id: `${messageType}-${Date.now()}`, ts: Date.now(), body }))
 }
 
+const scheduleReconnect = () => {
+  if (state.reconnectTimer) {
+    return
+  }
+  const attempt = state.reconnectAttempts + 1
+  state.reconnectAttempts = attempt
+  state.lastSocketEvent = 'reconnect_scheduled'
+  const delayMs = Math.min(1000 * (2 ** (attempt - 1)), 10000)
+  setStatus(`reconnecting (${attempt})`)
+  state.reconnectTimer = window.setTimeout(() => {
+    state.reconnectTimer = null
+    connect()
+  }, delayMs)
+}
+
 /**
  * Establish WebSocket connection to server
  */
 const connect = () => {
+  if (state.ws && (state.ws.readyState === WebSocket.OPEN || state.ws.readyState === WebSocket.CONNECTING)) {
+    return
+  }
+
   const protocol = location.protocol === 'https:' ? 'wss' : 'ws'
   state.ws = new WebSocket(`${protocol}://${location.host}/ws`)
+  state.lastSocketEvent = 'connect_start'
+  state.lastSocketError = ''
+  setStatus('connecting')
 
   state.ws.addEventListener('open', () => {
+    state.reconnectAttempts = 0
+    if (state.reconnectTimer) {
+      window.clearTimeout(state.reconnectTimer)
+      state.reconnectTimer = null
+    }
+    state.lastSocketEvent = 'open'
     setStatus('connected')
     send('hello', {
       client: { name: 'hubot-chat-p2p-web', ver: '0.1.0', platform: 'browser' },
@@ -177,10 +311,21 @@ const connect = () => {
   })
 
   state.ws.addEventListener('close', () => {
+    state.lastSocketEvent = 'close'
     setStatus('disconnected')
+    scheduleReconnect()
+  })
+
+  state.ws.addEventListener('error', () => {
+    state.lastSocketEvent = 'error'
+    state.lastSocketError = 'socket error'
+    setStatus('socket error')
+    renderMobileDiagnostics()
   })
 
   state.ws.addEventListener('message', (event) => {
+    state.lastSocketEvent = 'message'
+    renderMobileDiagnostics()
     const msg = JSON.parse(event.data)
     handleMessage(msg)
   })
@@ -209,18 +354,40 @@ const handleError = (msg) => {
   dom.authHint.textContent = errorMsg
   dom.signinHint.textContent = errorMsg
   showToast(errorMsg)
+
+  if (
+    msg.reply_to?.startsWith('rtc.join-') &&
+    msg.body?.code === 'NOT_FOUND' &&
+    isVoiceChannel(state.currentChannelId)
+  ) {
+    state.channelCallMap.delete(state.currentChannelId)
+    ensureVoiceStateForChannel(state.currentChannelId)
+    return
+  }
+
   if (msg.body?.message?.includes('Not a member') && state.currentChannelId) {
     send('channel.join', { channel_id: state.currentChannelId })
   }
 }
+
+const isValidSdp = (value) => typeof value === 'string' && value.trim().startsWith('v=')
 
 /**
  * Handle incoming offer from peer
  * @param {Object} body - rtc.offer_event body
  */
 const handleOffer = async (body) => {
+  if (!isValidSdp(body?.sdp)) {
+    console.warn('Ignoring invalid rtc.offer_event SDP', body)
+    return
+  }
   const pc = createPeerConnection(body.from_peer_id)
   await pc.setRemoteDescription({ type: 'offer', sdp: body.sdp })
+  const pending = state.pendingIceByPeer.get(body.from_peer_id) || []
+  for (const candidate of pending) {
+    await pc.addIceCandidate(candidate)
+  }
+  state.pendingIceByPeer.delete(body.from_peer_id)
   const answer = await pc.createAnswer()
   await pc.setLocalDescription(answer)
   send('rtc.answer', {
@@ -236,11 +403,20 @@ const handleOffer = async (body) => {
  * @param {Object} body - rtc.answer_event body
  */
 const handleAnswer = async (body) => {
+  if (!isValidSdp(body?.sdp)) {
+    console.warn('Ignoring invalid rtc.answer_event SDP', body)
+    return
+  }
   const pc = state.peerConnections.get(body.from_peer_id)
   if (!pc) {
     return
   }
   await pc.setRemoteDescription({ type: 'answer', sdp: body.sdp })
+  const pending = state.pendingIceByPeer.get(body.from_peer_id) || []
+  for (const candidate of pending) {
+    await pc.addIceCandidate(candidate)
+  }
+  state.pendingIceByPeer.delete(body.from_peer_id)
 }
 
 /**
@@ -253,6 +429,12 @@ const handleIce = async (body) => {
     return
   }
   if (body.candidate) {
+    if (!pc.remoteDescription) {
+      const pending = state.pendingIceByPeer.get(body.from_peer_id) || []
+      pending.push(body.candidate)
+      state.pendingIceByPeer.set(body.from_peer_id, pending)
+      return
+    }
     await pc.addIceCandidate(body.candidate)
   }
 }
@@ -263,8 +445,9 @@ const handleIce = async (body) => {
  */
 const handlePeerEvent = (body) => {
   if (body.kind === 'join' && body.peer?.peer_id && body.peer.peer_id !== state.selfPeerId) {
+    // Only establish the peer connection here. The joining peer initiates offers
+    // from rtc.participants to avoid simultaneous offer glare.
     createPeerConnection(body.peer.peer_id)
-    negotiatePeer(body.peer.peer_id)
   }
   if (body.kind === 'leave' && body.peer?.peer_id) {
     closePeer(body.peer.peer_id)
@@ -360,6 +543,9 @@ const messageHandlers = {
       renderChannels()
       if (msg.body.channel.channel_id === state.currentChannelId) {
         dom.activeRoom.textContent = msg.body.channel.name
+        updateChannelLayoutMode()
+        ensureVoiceStateForChannel(state.currentChannelId)
+        updateCallControls()
       }
       showToast(`Channel renamed to "${msg.body.channel.name}"`)
     }
@@ -389,6 +575,9 @@ const messageHandlers = {
   },
   'rtc.call_event': (msg) => {
     state.channelCallMap.set(msg.body.channel_id, msg.body.call_id)
+    if (!state.callId && isVoiceChannel(state.currentChannelId) && state.currentChannelId === msg.body.channel_id) {
+      ensureVoiceStateForChannel(state.currentChannelId)
+    }
     updateCallControls()
   },
   'rtc.call': (msg) => {
@@ -405,10 +594,10 @@ const messageHandlers = {
       startAudio()
     }
   },
-  'rtc.peer_event': handlePeerEvent,
-  'rtc.offer_event': handleOffer,
-  'rtc.answer_event': handleAnswer,
-  'rtc.ice_event': handleIce,
+  'rtc.peer_event': (msg) => handlePeerEvent(msg.body || {}),
+  'rtc.offer_event': (msg) => handleOffer(msg.body || {}),
+  'rtc.answer_event': (msg) => handleAnswer(msg.body || {}),
+  'rtc.ice_event': (msg) => handleIce(msg.body || {}),
   'rtc.stream_event': () => {
     // stream events are informational
   },
@@ -449,7 +638,10 @@ const messageHandlers = {
 const handleMessage = (msg) => {
   const handler = messageHandlers[msg.t]
   if (handler) {
-    handler(msg)
+    Promise.resolve(handler(msg)).catch((error) => {
+      console.error('Client message handler failed', msg?.t, error)
+      showToast('Realtime handler error. Retrying may help.')
+    })
   }
 }
 
@@ -488,8 +680,11 @@ const applyHubDeleted = (body) => {
     if (nextChannelId) {
       setActiveChannel(nextChannelId)
     } else {
+      state.voiceActive = false
+      leaveCurrentVoiceCall()
       dom.activeRoom.textContent = 'No channel selected'
       dom.messages.innerHTML = ''
+      updateChannelLayoutMode()
       updateCallControls()
     }
   }
@@ -517,8 +712,11 @@ const applyChannelDeleted = (body) => {
     if (nextChannelId) {
       setActiveChannel(nextChannelId)
     } else {
+      state.voiceActive = false
+      leaveCurrentVoiceCall()
       dom.activeRoom.textContent = 'No channel selected'
       dom.messages.innerHTML = ''
+      updateChannelLayoutMode()
       updateCallControls()
     }
   }
@@ -530,7 +728,8 @@ const applyChannelDeleted = (body) => {
 function openCreateRoomModal(hubId = null) {
   state.selectedHubIdForChannelCreation = hubId
   dom.modalRoomName.value = ''
-  dom.modalRoomKind.value = 'public'
+  dom.modalRoomKind.value = 'text'
+  dom.modalRoomVisibility.value = 'public'
   // Populate hub selector
   dom.modalHubSelect.innerHTML = '<option value="">Select a hub</option>'
   state.hubs.forEach(hub => {
@@ -630,7 +829,9 @@ const renderHubs = () => {
         const channelItem = document.createElement('li')
         channelItem.className = 'channel-item'
         // Always show an icon for clarity
-        const icon = channel.visibility === 'public' ? '🔓' : '🔒'
+        const kindIcon = channel.kind === 'voice' ? '🔊' : '#'
+        const visibilityIcon = channel.visibility === 'public' ? '🌍' : '🔒'
+        const icon = `${kindIcon} ${visibilityIcon}`
         channelItem.innerHTML = ''
         const channelName = document.createElement('span')
         channelName.textContent = `${icon} ${channel.name}`
@@ -649,7 +850,6 @@ const renderHubs = () => {
           }
           clickTimer = setTimeout(() => {
             setActiveChannel(channel.channel_id)
-            send('channel.join', { channel_id: channel.channel_id })
             clickTimer = null
           }, 250)
         })
@@ -779,12 +979,51 @@ const startEditingChannelName = (channel, channelNameElement, icon) => {
 
 const renderChannels = renderHubs
 
+const leaveCurrentVoiceCall = () => {
+  if (!state.callId) {
+    return
+  }
+  if (state.selfPeerId) {
+    send('rtc.leave', { call_id: state.callId, peer_id: state.selfPeerId })
+  }
+  teardownCall()
+}
+
+const ensureVoiceStateForChannel = (channelId) => {
+  if (!isVoiceChannel(channelId)) {
+    // Keep current voice session alive while browsing text channels.
+    // A voice session only resets when switching to a different voice channel.
+    return
+  }
+
+  state.voiceActive = true
+  if (state.callId && state.callChannelId === channelId) {
+    updateCallControls()
+    return
+  }
+
+  if (state.callId && state.callChannelId !== channelId) {
+    leaveCurrentVoiceCall()
+  }
+
+  const existingCall = state.channelCallMap.get(channelId)
+  if (existingCall) {
+    state.callId = existingCall
+    state.callChannelId = channelId
+    send('rtc.join', { call_id: existingCall, peer_meta: { device: 'browser', capabilities: { screen: true } } })
+  } else {
+    send('rtc.call_create', { channel_id: channelId, kind: 'mesh', media: { audio: true, video: true } })
+  }
+  updateCallControls()
+}
+
 /**
  * Set active channel and load message history
  * @param {string} channelId
  */
 const setActiveChannel = (channelId) => {
   state.currentChannelId = channelId
+  updateChannelLayoutMode()
   dom.activeRoom.textContent = state.channels.find((channel) => channel.channel_id === channelId)?.name || channelId
   renderChannels()
   const cached = loadCachedMessages(channelId)
@@ -793,7 +1032,9 @@ const setActiveChannel = (channelId) => {
     renderMessages(channelId)
   }
   send('channel.join', { channel_id: channelId })
+  ensureVoiceStateForChannel(channelId)
   updateCallControls()
+  setSidebarMenuOpen(false)
 }
 
 /**
@@ -881,20 +1122,33 @@ const loadCachedMessages = (channelId) => {
  * Update UI state for voice call controls
  */
 const updateCallControls = () => {
-  const activeCallId = state.channelCallMap.get(state.currentChannelId)
-  if (!state.callId && activeCallId) {
-    dom.startCallBtn.textContent = 'Join voice'
-  } else if (state.callId) {
-    dom.startCallBtn.textContent = 'Leave voice'
+  const inVoiceChannel = isVoiceChannel(state.currentChannelId)
+  const inActiveVoiceCall = Boolean(state.callId && state.callChannelId === state.currentChannelId)
+
+  dom.startCallBtn.disabled = !inVoiceChannel || !inActiveVoiceCall
+  dom.toggleMediaBtn.disabled = !inActiveVoiceCall
+  dom.shareScreenBtn.disabled = !inActiveVoiceCall
+  dom.hangupCallBtn.disabled = !state.callId
+
+  dom.startCallBtn.textContent = state.micMuted ? '🔇' : '🎤'
+  dom.startCallBtn.title = state.micMuted ? 'Unmute microphone' : 'Mute microphone'
+  dom.toggleMediaBtn.textContent = state.videoStream ? '📕' : '📷'
+  dom.toggleMediaBtn.title = state.videoStream ? 'Turn camera off' : 'Turn camera on'
+  dom.shareScreenBtn.textContent = state.screenStream ? '🛑' : '🖥'
+  dom.shareScreenBtn.title = state.screenStream ? 'Stop screen share' : 'Start screen share'
+
+  if (!inVoiceChannel) {
+    dom.voiceHint.textContent = 'Select a voice channel to join live audio'
+  } else if (!inActiveVoiceCall) {
+    dom.voiceHint.textContent = 'Connecting to voice channel...'
   } else {
-    dom.startCallBtn.textContent = 'Join voice'
+    dom.voiceHint.textContent = state.micMuted
+      ? 'In voice. You are muted'
+      : 'In voice. Mic is live'
   }
-  dom.toggleMediaBtn.disabled = !state.callId
-  dom.shareScreenBtn.disabled = !state.callId
-  if (!state.callId) {
-    dom.voiceHint.textContent = 'Join voice to enable video and screen share'
-  } else {
-    dom.voiceHint.textContent = 'In voice. You can start video or share your screen'
+
+  if (dom.streamsEmpty) {
+    dom.streamsEmpty.classList.toggle('hidden', dom.streams.children.length > 0)
   }
 }
 
@@ -953,7 +1207,12 @@ const createPeerConnection = (peerId) => {
   pc.ontrack = (event) => {
     const stream = event.streams[0]
     if (stream) {
-      addStreamTile(stream, `${peerId}`, false)
+      if (stream.getVideoTracks().length === 0) {
+        ensureRemoteAudio(stream, peerId)
+        return
+      }
+      addStreamTile(stream, `${peerId}`, false, peerId)
+      ensureRemoteAudio(stream, peerId)
     }
   }
   state.peerConnections.set(peerId, pc)
@@ -1016,6 +1275,51 @@ const closePeer = (peerId) => {
     pc.close()
   }
   state.peerConnections.delete(peerId)
+
+  for (const [streamId, tile] of state.streamTiles.entries()) {
+    if (tile.dataset.peerId === peerId) {
+      tile.remove()
+      state.streamTiles.delete(streamId)
+    }
+  }
+  for (const [streamId, audioEl] of state.remoteAudioEls.entries()) {
+    if (audioEl.dataset.peerId === peerId) {
+      audioEl.srcObject = null
+      audioEl.remove()
+      state.remoteAudioEls.delete(streamId)
+    }
+  }
+  updateCallControls()
+}
+
+const ensureRemoteAudio = (stream, ownerPeerId) => {
+  if (!stream.getAudioTracks().length) {
+    return
+  }
+  if (state.remoteAudioEls.has(stream.id)) {
+    return
+  }
+  const audio = document.createElement('audio')
+  audio.autoplay = true
+  audio.muted = false
+  audio.srcObject = stream
+  audio.dataset.peerId = ownerPeerId
+  audio.style.display = 'none'
+  document.body.appendChild(audio)
+  audio.play().catch(() => {})
+  state.remoteAudioEls.set(stream.id, audio)
+
+  const cleanupIfEnded = () => {
+    const hasLiveAudio = stream.getAudioTracks().some((track) => track.readyState === 'live')
+    if (!hasLiveAudio) {
+      audio.srcObject = null
+      audio.remove()
+      state.remoteAudioEls.delete(stream.id)
+    }
+  }
+  stream.getAudioTracks().forEach((track) => {
+    track.addEventListener('ended', cleanupIfEnded)
+  })
 }
 
 /**
@@ -1024,17 +1328,36 @@ const closePeer = (peerId) => {
  * @param {string} label - Display label
  * @param {boolean} isLocal - Whether this is local or remote stream
  */
-const addStreamTile = (stream, label, isLocal) => {
+const addStreamTile = (stream, label, isLocal, ownerPeerId = null) => {
+  if (ownerPeerId) {
+    for (const [existingStreamId, existingTile] of state.streamTiles.entries()) {
+      if (existingStreamId === stream.id || existingTile.dataset.peerId !== ownerPeerId) {
+        continue
+      }
+      const existingVideo = existingTile.querySelector('video')
+      const existingStream = existingVideo?.srcObject
+      const hasLiveVideo = !!existingStream?.getVideoTracks().some((track) => track.readyState === 'live')
+      if (!hasLiveVideo) {
+        existingTile.remove()
+        state.streamTiles.delete(existingStreamId)
+      }
+    }
+  }
+
   if (state.streamTiles.has(stream.id)) {
     return
   }
   const tile = document.createElement('div')
   tile.className = 'stream-tile'
+  if (ownerPeerId) {
+    tile.dataset.peerId = ownerPeerId
+  }
   const video = document.createElement('video')
   video.autoplay = true
   video.muted = isLocal
   video.playsInline = true
   video.srcObject = stream
+  video.play().catch(() => {})
   const caption = document.createElement('div')
   caption.className = 'stream-label'
   caption.textContent = isLocal ? `${label} (you)` : label
@@ -1042,6 +1365,18 @@ const addStreamTile = (stream, label, isLocal) => {
   tile.appendChild(caption)
   dom.streams.appendChild(tile)
   state.streamTiles.set(stream.id, tile)
+
+  const cleanupIfEnded = () => {
+    const hasLiveVideo = stream.getVideoTracks().some((track) => track.readyState === 'live')
+    if (!hasLiveVideo) {
+      removeStreamTile(stream)
+    }
+  }
+  stream.getVideoTracks().forEach((track) => {
+    track.addEventListener('ended', cleanupIfEnded)
+  })
+
+  updateCallControls()
 }
 
 /**
@@ -1053,6 +1388,7 @@ const removeStreamTile = (stream) => {
   if (tile) {
     tile.remove()
     state.streamTiles.delete(stream.id)
+    updateCallControls()
   }
 }
 
@@ -1063,11 +1399,22 @@ const startAudio = async () => {
   if (state.audioStream) {
     return
   }
-  state.audioStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false })
+  try {
+    state.audioStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false })
+  } catch (error) {
+    state.micMuted = true
+    showToast('Microphone access was denied')
+    updateCallControls()
+    return
+  }
+  state.audioStream.getAudioTracks().forEach((track) => {
+    track.enabled = !state.micMuted
+  })
   state.peerConnections.forEach((pc, peerId) => {
     attachLocalTracks(pc)
     negotiatePeer(peerId)
   })
+  updateCallControls()
 }
 
 /**
@@ -1079,6 +1426,19 @@ const stopAudio = () => {
   }
   state.audioStream.getTracks().forEach((track) => track.stop())
   state.audioStream = null
+  state.micMuted = false
+  updateCallControls()
+}
+
+const toggleMicMute = () => {
+  if (!state.callId || !state.audioStream) {
+    return
+  }
+  state.micMuted = !state.micMuted
+  state.audioStream.getAudioTracks().forEach((track) => {
+    track.enabled = !state.micMuted
+  })
+  updateCallControls()
 }
 
 /**
@@ -1090,13 +1450,13 @@ const startVideo = async () => {
     return
   }
   state.videoStream = await navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 360 }, audio: false })
-  addStreamTile(state.videoStream, 'Camera', true)
+  addStreamTile(state.videoStream, 'Camera', true, 'local')
   notifyStreamPublish('cam', 'camera', 'Camera', state.videoStream)
   state.peerConnections.forEach((pc, peerId) => {
     attachLocalTracks(pc)
     negotiatePeer(peerId)
   })
-  dom.toggleMediaBtn.textContent = 'Stop video'
+  updateCallControls()
 }
 
 /**
@@ -1109,7 +1469,7 @@ const stopVideo = () => {
   state.videoStream.getTracks().forEach((track) => track.stop())
   removeStreamTile(state.videoStream)
   state.videoStream = null
-  dom.toggleMediaBtn.textContent = 'Start video'
+  updateCallControls()
 }
 
 /**
@@ -1121,13 +1481,13 @@ const startScreenShare = async () => {
     return
   }
   state.screenStream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: false })
-  addStreamTile(state.screenStream, 'Screen', true)
+  addStreamTile(state.screenStream, 'Screen', true, 'local')
   notifyStreamPublish('screen', 'screen', 'Screen', state.screenStream)
   state.peerConnections.forEach((pc, peerId) => {
     attachLocalTracks(pc)
     negotiatePeer(peerId)
   })
-  dom.shareScreenBtn.textContent = 'Stop share'
+  updateCallControls()
   state.screenStream.getVideoTracks()[0].addEventListener('ended', () => {
     stopScreenShare()
   })
@@ -1143,7 +1503,7 @@ const stopScreenShare = () => {
   state.screenStream.getTracks().forEach((track) => track.stop())
   removeStreamTile(state.screenStream)
   state.screenStream = null
-  dom.shareScreenBtn.textContent = 'Share screen'
+  updateCallControls()
 }
 
 /**
@@ -1175,6 +1535,12 @@ const notifyStreamPublish = (streamId, kind, label, stream) => {
 const teardownCall = () => {
   state.peerConnections.forEach((pc) => pc.close())
   state.peerConnections.clear()
+  state.remoteAudioEls.forEach((audioEl) => {
+    audioEl.srcObject = null
+    audioEl.remove()
+  })
+  state.remoteAudioEls.clear()
+  state.pendingIceByPeer.clear()
   state.callId = null
   state.callChannelId = null
   state.selfPeerId = null
@@ -1189,6 +1555,33 @@ const teardownCall = () => {
  * Set up all event listeners for UI interactions
  */
 const setupEventListeners = () => {
+  dom.mobileMenuBtn.addEventListener('click', () => {
+    setSidebarMenuOpen(!state.sidebarMenuOpen)
+  })
+
+  dom.sidebarOverlay.addEventListener('click', () => {
+    setSidebarMenuOpen(false)
+  })
+
+  window.addEventListener('resize', () => {
+    setSidebarMenuOpen(state.sidebarMenuOpen)
+  })
+
+  document.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape') {
+      setSidebarMenuOpen(false)
+      setTextChatDrawerOpen(false)
+    }
+  })
+
+  dom.textChatToggle.addEventListener('click', () => {
+    setTextChatDrawerOpen(!state.textChatDrawerOpen)
+  })
+
+  dom.textChatClose.addEventListener('click', () => {
+    setTextChatDrawerOpen(false)
+  })
+
   // Auth tab switching
   dom.signupTab.addEventListener('click', () => {
     dom.signupTab.classList.add('active')
@@ -1319,6 +1712,7 @@ const setupEventListeners = () => {
   const submitCreateRoom = () => {
     const name = dom.modalRoomName.value.trim()
     const kind = dom.modalRoomKind.value
+    const visibility = dom.modalRoomVisibility.value
     const hubId = state.selectedHubIdForChannelCreation || dom.modalHubSelect.value
     
     if (!name) {
@@ -1331,7 +1725,7 @@ const setupEventListeners = () => {
       return
     }
     
-    send('channel.create', { hub_id: hubId, kind: 'text', name, visibility: kind })
+    send('channel.create', { hub_id: hubId, kind, name, visibility })
     closeCreateRoomModal()
   }
 
@@ -1422,25 +1816,13 @@ const setupEventListeners = () => {
     send('search.query', { scope: { kind: 'channel', channel_id: state.currentChannelId }, q, limit: 20 })
   })
 
-  // Voice call listeners
+  // Voice and media listeners
   dom.startCallBtn.addEventListener('click', () => {
-    if (!state.currentChannelId) {
-      return
-    }
-    const existingCall = state.channelCallMap.get(state.currentChannelId)
-    if (state.callId) {
-      send('rtc.leave', { call_id: state.callId, peer_id: state.selfPeerId })
-      teardownCall()
-      return
-    }
-    state.voiceActive = true
-    if (existingCall) {
-      state.callId = existingCall
-      state.callChannelId = state.currentChannelId
-      send('rtc.join', { call_id: existingCall, peer_meta: { device: 'browser', capabilities: { screen: true } } })
-      return
-    }
-    send('rtc.call_create', { channel_id: state.currentChannelId, kind: 'mesh', media: { audio: true, video: true } })
+    toggleMicMute()
+  })
+
+  dom.hangupCallBtn.addEventListener('click', () => {
+    leaveCurrentVoiceCall()
   })
 
   dom.toggleMediaBtn.addEventListener('click', () => {
@@ -1469,4 +1851,5 @@ const setupEventListeners = () => {
 // Initialize app
 setupEventListeners()
 updateCallControls()
+renderMobileDiagnostics()
 connect()

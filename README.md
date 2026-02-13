@@ -47,6 +47,30 @@ npm test
 - `TURN_URLS` (comma separated TURN urls)
 - `TURN_USERNAME`
 - `TURN_CREDENTIAL`
+- `HTTPS_CERT_FILE` (optional; enables HTTPS when set with key file)
+- `HTTPS_KEY_FILE` (optional; enables HTTPS when set with cert file)
+
+## HTTPS on LAN (self-signed)
+
+To run on `https://192.168.254.199:3000`, generate a cert whose SAN includes that IP:
+
+```bash
+openssl req -x509 -newkey rsa:2048 -sha256 -nodes -days 365 \
+  -keyout certs/dev-key.pem \
+  -out certs/dev-cert.pem \
+  -subj "/CN=192.168.254.199" \
+  -addext "subjectAltName = IP:192.168.254.199"
+```
+
+Start server with TLS:
+
+```bash
+HTTPS_CERT_FILE=./certs/dev-cert.pem HTTPS_KEY_FILE=./certs/dev-key.pem npm start
+```
+
+Notes:
+- Chrome on Windows will still warn until you trust the self-signed cert.
+- Import `dev-cert.pem` into `Trusted Root Certification Authorities` on the Windows machine running Chrome.
 
 ## Why signaling is centralized
 
