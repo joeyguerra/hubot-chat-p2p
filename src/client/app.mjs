@@ -1,45 +1,23 @@
-import { AnswererConnectionActor, OffererConnectionActor } from './RtcConnector.mjs'
+import { WsClient } from './WsClient.mjs'
+import { RtcCallService } from './RtcCallService.mjs'
+import { AppStore, createInitialState } from './AppStore.mjs'
+import { EventBus } from './EventBus.mjs'
+import { CallControlsPresenter } from './CallControlsPresenter.mjs'
+import { AuthPresenter } from './AuthPresenter.mjs'
+import { SidebarPresenter } from './SidebarPresenter.mjs'
+import { SidebarTreePresenter } from './SidebarTreePresenter.mjs'
+import { MessagePresenter } from './MessagePresenter.mjs'
+import { CallStateService } from './CallStateService.mjs'
+import { ClientStateService } from './ClientStateService.mjs'
+import { getOrCreateInboundStream as resolveInboundStream } from './RtcInboundStream.mjs'
 
 /**
  * Centralized application state
  * @type {Object}
  */
-const state = {
-  ws: null,
-  sessionToken: localStorage.getItem('session_token') || null,
-  user: null,
-  hubs: [],
-  channels: [],
-  currentHubId: null,
-  currentChannelId: null,
-  selectedHubIdForChannelCreation: null,
-  messages: new Map(),
-  callId: null,
-  callChannelId: null,
-  selfPeerId: null,
-  peerConnections: new Map(),
-  ice: null,
-  audioStream: null,
-  videoStream: null,
-  screenStream: null,
-  streamTiles: new Map(),
-  streamTilePruneTimers: new Map(),
-  remoteAudioEls: new Map(),
-  remoteInboundStreamsByPeer: new Map(),
-  pendingIceByPeer: new Map(),
-  pendingAuthRequest: null,
-  channelCallMap: new Map(),
-  toastTimer: null,
-  voiceActive: false,
-  sidebarMenuOpen: false,
-  micMuted: false,
-  textChatDrawerOpen: false,
-  reconnectTimer: null,
-  wsConnectTimer: null,
-  reconnectAttempts: 0,
-  lastSocketEvent: 'init',
-  lastSocketError: ''
-}
+const store = new AppStore(createInitialState())
+const state = store.state
+const eventBus = new EventBus()
 
 /**
  * DOM query selector shorthand
@@ -127,30 +105,57 @@ const dom = {
 }
 
 const MOBILE_SIDEBAR_BREAKPOINT = 900
+let wsClient = null
+let rtcCallService = null
+let callControlsPresenter = null
+let authPresenter = null
+let sidebarPresenter = null
+let sidebarTreePresenter = null
+let messagePresenter = null
+let callStateService = null
+let clientStateService = null
 
 const isMobileViewport = () => window.innerWidth <= MOBILE_SIDEBAR_BREAKPOINT
 
-const syncSidebarMenuUi = () => {
-  if (!dom.mobileMenuBtn || !dom.sidebar || !dom.sidebarOverlay) {
-    return
-  }
-  dom.mobileMenuBtn.setAttribute('aria-expanded', state.sidebarMenuOpen ? 'true' : 'false')
-  dom.sidebar.classList.toggle('mobile-open', state.sidebarMenuOpen)
-  dom.sidebarOverlay.classList.toggle('show', state.sidebarMenuOpen)
-}
-
 const setSidebarMenuOpen = (isOpen) => {
-  if (!state.user || !isMobileViewport()) {
-    state.sidebarMenuOpen = false
-  } else {
-    state.sidebarMenuOpen = Boolean(isOpen)
-  }
-  syncSidebarMenuUi()
+  sidebarPresenter.setMenuOpen(isOpen, Boolean(state.user))
 }
 
-const getChannelById = (channelId) => state.channels.find((channel) => channel.channel_id === channelId) || null
+const isVoiceChannel = (channelId) => store.isVoiceChannel(channelId)
 
-const isVoiceChannel = (channelId) => getChannelById(channelId)?.kind === 'voice'
+callControlsPresenter = new CallControlsPresenter({
+  state,
+  dom,
+  isVoiceChannel
+})
+
+authPresenter = new AuthPresenter({ dom })
+sidebarPresenter = new SidebarPresenter({ dom, state, isMobileViewport })
+sidebarTreePresenter = new SidebarTreePresenter({
+  dom,
+  state,
+  onOpenCreateRoomModal: (hubId) => openCreateRoomModal(hubId),
+  onDeleteHub: (hub) => {
+    const confirmed = window.confirm(`Delete hub "${hub.name}" and all its channels?`)
+    if (!confirmed) {
+      return
+    }
+    send('hub.delete', { hub_id: hub.hub_id })
+  },
+  onDeleteChannel: (channel) => {
+    const confirmed = window.confirm(`Delete channel "${channel.name}"?`)
+    if (!confirmed) {
+      return
+    }
+    send('channel.delete', { channel_id: channel.channel_id })
+  },
+  onSetActiveChannel: (channelId) => setActiveChannel(channelId),
+  onUpdateHubName: (hubId, name) => send('hub.update', { hub_id: hubId, name }),
+  onUpdateChannelName: (channelId, name) => send('channel.update', { channel_id: channelId, name })
+})
+messagePresenter = new MessagePresenter({ dom, state })
+callStateService = new CallStateService({ store })
+clientStateService = new ClientStateService({ store })
 
 const syncTextChatDrawerUi = () => {
   if (!dom.textChatToggle || !dom.textChatDrawer) {
@@ -162,7 +167,7 @@ const syncTextChatDrawerUi = () => {
 }
 
 const setTextChatDrawerOpen = (isOpen) => {
-  state.textChatDrawerOpen = Boolean(isOpen)
+  clientStateService.setTextChatDrawerOpen(Boolean(isOpen))
   syncTextChatDrawerUi()
 }
 
@@ -188,6 +193,9 @@ const setStatus = (text) => {
 }
 
 const wsReadyStateText = () => {
+  if (wsClient) {
+    return wsClient.readyStateText()
+  }
   if (!state.ws) return 'none'
   switch (state.ws.readyState) {
     case WebSocket.CONNECTING: return 'connecting'
@@ -304,29 +312,13 @@ const showToast = (text) => {
  * Update UI visibility based on auth state
  */
 const setAuthUi = () => {
-  if (state.user) {
-    dom.userPill.textContent = `@${state.user.handle}`
-    dom.logoutBtn.classList.remove('hidden')
-    dom.authCard.classList.add('hidden')
-    dom.layout.classList.remove('hidden')
-    if (state.user.roles?.includes('admin')) {
-      dom.adminPanel.classList.remove('hidden')
-    } else {
-      dom.adminPanel.classList.add('hidden')
-    }
-    setSidebarMenuOpen(false)
-    setTextChatDrawerOpen(false)
-    showToast('Signed in. Create a channel or invite someone')
-  } else {
-    dom.userPill.textContent = 'signed out'
-    dom.logoutBtn.classList.add('hidden')
-    dom.authCard.classList.remove('hidden')
-    dom.layout.classList.add('hidden')
-    dom.adminPanel.classList.add('hidden')
-    setSidebarMenuOpen(false)
-    setTextChatDrawerOpen(false)
-  }
-  updateChannelLayoutMode()
+  authPresenter.render({
+    user: state.user,
+    onSetSidebarMenuOpen: setSidebarMenuOpen,
+    onSetTextChatDrawerOpen: setTextChatDrawerOpen,
+    onUpdateChannelLayoutMode: updateChannelLayoutMode,
+    onToast: showToast
+  })
 }
 
 /**
@@ -342,137 +334,93 @@ const buildEnvelope = (messageType, body) => ({
   body
 })
 
+wsClient = new WsClient({
+  urlFactory: () => {
+    const protocol = location.protocol === 'https:' ? 'wss' : 'ws'
+    return `${protocol}://${location.host}/ws`
+  },
+  onSocketCreated: (ws) => {
+    clientStateService.setSocket(ws)
+  },
+  onStatus: (text) => {
+    setStatus(text)
+  },
+  onSocketEvent: (event, errorText) => {
+    const reconnectAttempts = event === 'reconnect_scheduled'
+      ? wsClient.reconnectAttempts
+      : (event === 'open' ? 0 : state.reconnectAttempts)
+    clientStateService.setSocketStatus({
+      event,
+      error: errorText || '',
+      reconnectAttempts
+    })
+    if (event === 'message' || event === 'error' || event === 'connect_timeout') {
+      renderMobileDiagnostics()
+    }
+  },
+  onOpen: () => {
+    send('hello', {
+      client: { name: 'hubot-chat-p2p-web', ver: '0.1.0', platform: 'browser' },
+      resume: { session_token: state.sessionToken }
+    })
+    flushPendingAuthRequest()
+  },
+  onClose: () => {
+    if (state.pendingAuthRequest) {
+      const pendingMsg = 'Still connecting... retrying websocket'
+      authPresenter.setAuthMessage(pendingMsg)
+    }
+  },
+  onError: () => {
+    renderMobileDiagnostics()
+  },
+  onMessage: (rawData) => {
+    const msg = JSON.parse(rawData)
+    eventBus.emit('ws:message', msg)
+    handleMessage(msg)
+  }
+})
+
 const flushPendingAuthRequest = () => {
-  if (!state.ws || state.ws.readyState !== WebSocket.OPEN) {
+  if (!wsClient.isOpen()) {
     return
   }
   if (!state.pendingAuthRequest) {
     return
   }
   const pending = state.pendingAuthRequest
-  state.pendingAuthRequest = null
-  state.ws.send(JSON.stringify(buildEnvelope(pending.messageType, pending.body)))
+  clientStateService.clearPendingAuthRequest()
+  wsClient.sendJson(buildEnvelope(pending.messageType, pending.body))
 }
 
 const sendAuthRequest = (messageType, body) => {
-  if (state.ws && state.ws.readyState === WebSocket.OPEN) {
+  if (wsClient.isOpen()) {
     send(messageType, body)
     return
   }
-  state.pendingAuthRequest = { messageType, body }
+  clientStateService.setPendingAuthRequest({ messageType, body })
   connect()
   const pendingMsg = 'Connecting... sign-in will be sent automatically'
-  dom.authHint.textContent = pendingMsg
-  dom.signinHint.textContent = pendingMsg
+  authPresenter.setAuthMessage(pendingMsg)
   showToast(pendingMsg)
 }
 
 const send = (messageType, body) => {
-  if (!state.ws || state.ws.readyState !== WebSocket.OPEN) {
+  const envelope = buildEnvelope(messageType, body)
+  if (!wsClient.sendJson(envelope)) {
     const message = 'Connection not ready. Please wait...'
-    dom.authHint.textContent = message
-    dom.signinHint.textContent = message
+    authPresenter.setAuthMessage(message)
     showToast(message)
     return
   }
-  state.ws.send(JSON.stringify(buildEnvelope(messageType, body)))
-}
-
-const scheduleReconnect = () => {
-  if (state.reconnectTimer) {
-    return
-  }
-  const attempt = state.reconnectAttempts + 1
-  state.reconnectAttempts = attempt
-  state.lastSocketEvent = 'reconnect_scheduled'
-  const delayMs = Math.min(1000 * (2 ** (attempt - 1)), 10000)
-  setStatus(`reconnecting (${attempt})`)
-  state.reconnectTimer = window.setTimeout(() => {
-    state.reconnectTimer = null
-    connect()
-  }, delayMs)
-}
-
-const clearWsConnectTimer = () => {
-  if (!state.wsConnectTimer) {
-    return
-  }
-  window.clearTimeout(state.wsConnectTimer)
-  state.wsConnectTimer = null
+  eventBus.emit('ws:send', envelope)
 }
 
 /**
  * Establish WebSocket connection to server
  */
 const connect = () => {
-  if (state.ws && (state.ws.readyState === WebSocket.OPEN || state.ws.readyState === WebSocket.CONNECTING)) {
-    return
-  }
-
-  const protocol = location.protocol === 'https:' ? 'wss' : 'ws'
-  state.ws = new WebSocket(`${protocol}://${location.host}/ws`)
-  state.lastSocketEvent = 'connect_start'
-  state.lastSocketError = ''
-  setStatus('connecting')
-  clearWsConnectTimer()
-  state.wsConnectTimer = window.setTimeout(() => {
-    if (!state.ws || state.ws.readyState !== WebSocket.CONNECTING) {
-      return
-    }
-    state.lastSocketEvent = 'connect_timeout'
-    state.lastSocketError = 'socket open timed out after 10s'
-    setStatus('socket timeout')
-    try {
-      state.ws.close()
-    } catch (error) {
-      // ignore close errors during timeout recovery
-    }
-    scheduleReconnect()
-  }, 10000)
-
-  state.ws.addEventListener('open', () => {
-    clearWsConnectTimer()
-    state.reconnectAttempts = 0
-    if (state.reconnectTimer) {
-      window.clearTimeout(state.reconnectTimer)
-      state.reconnectTimer = null
-    }
-    state.lastSocketEvent = 'open'
-    setStatus('connected')
-    send('hello', {
-      client: { name: 'hubot-chat-p2p-web', ver: '0.1.0', platform: 'browser' },
-      resume: { session_token: state.sessionToken }
-    })
-    flushPendingAuthRequest()
-  })
-
-  state.ws.addEventListener('close', (event) => {
-    clearWsConnectTimer()
-    state.lastSocketEvent = 'close'
-    state.lastSocketError = `close ${event.code}${event.reason ? ` (${event.reason})` : ''}`
-    setStatus('disconnected')
-    if (state.pendingAuthRequest) {
-      const pendingMsg = 'Still connecting... retrying websocket'
-      dom.authHint.textContent = pendingMsg
-      dom.signinHint.textContent = pendingMsg
-    }
-    scheduleReconnect()
-  })
-
-  state.ws.addEventListener('error', () => {
-    clearWsConnectTimer()
-    state.lastSocketEvent = 'error'
-    state.lastSocketError = 'socket error'
-    setStatus('socket error')
-    renderMobileDiagnostics()
-  })
-
-  state.ws.addEventListener('message', (event) => {
-    state.lastSocketEvent = 'message'
-    renderMobileDiagnostics()
-    const msg = JSON.parse(event.data)
-    handleMessage(msg)
-  })
+  wsClient.connect()
 }
 
 /**
@@ -480,12 +428,15 @@ const connect = () => {
  * @param {Object} msg
  */
 const handleAuthSession = (msg) => {
-  state.user = msg.body.user
-  state.sessionToken = msg.body.session_token
+  store.dispatch({
+    type: 'auth/set',
+    user: msg.body.user,
+    sessionToken: msg.body.session_token,
+    source: 'auth.session'
+  })
   localStorage.setItem('session_token', state.sessionToken)
   send('hub.list', {})
   requestChannels()
-  setAuthUi()
   showToast('Welcome. You are now signed in')
 }
 
@@ -495,8 +446,7 @@ const handleAuthSession = (msg) => {
  */
 const handleError = (msg) => {
   const errorMsg = msg.body?.message || 'Server error'
-  dom.authHint.textContent = errorMsg
-  dom.signinHint.textContent = errorMsg
+  authPresenter.setAuthMessage(errorMsg)
   showToast(errorMsg)
 
   if (
@@ -504,7 +454,7 @@ const handleError = (msg) => {
     msg.body?.code === 'NOT_FOUND' &&
     isVoiceChannel(state.currentChannelId)
   ) {
-    state.channelCallMap.delete(state.currentChannelId)
+    callStateService.mapDelete(state.currentChannelId, 'rtc.join_not_found')
     ensureVoiceStateForChannel(state.currentChannelId)
     return
   }
@@ -512,6 +462,303 @@ const handleError = (msg) => {
   if (msg.body?.message?.includes('Not a member') && state.currentChannelId) {
     send('channel.join', { channel_id: state.currentChannelId })
   }
+}
+
+const handleHelloAck = (msg) => {
+  if (msg.body?.session?.authenticated) {
+    store.dispatch({
+      type: 'auth/set',
+      user: msg.body.session.user,
+      sessionToken: msg.body.session.session_token || state.sessionToken,
+      source: 'hello_ack'
+    })
+    localStorage.setItem('session_token', state.sessionToken)
+    send('hub.list', {})
+    requestChannels()
+  } else {
+    store.dispatch({ type: 'auth/set', user: null, source: 'hello_ack' })
+  }
+}
+
+const handleHubListResult = (msg) => {
+  store.dispatch({ type: 'hubs/set', hubs: msg.body.hubs || [] })
+}
+
+const handleChannelListResult = (msg) => {
+  store.dispatch({ type: 'channels/set', channels: msg.body.channels || [] })
+  if (!state.currentChannelId && state.channels.length > 0) {
+    setActiveChannel(state.channels[0].channel_id)
+  }
+  if (state.channels.length === 0 && state.user?.roles?.includes('admin')) {
+    send('channel.create', { hub_id: 'default', kind: 'text', name: 'general', visibility: 'public' })
+  }
+}
+
+const handleAdminInvite = (msg) => {
+  dom.adminInvite.value = msg.body.invite_token
+  dom.adminInviteSide.value = msg.body.invite_token
+}
+
+const handleHubCreated = (msg) => {
+  const exists = state.hubs.some((hub) => hub.hub_id === msg.body.hub.hub_id)
+  if (!exists) {
+    store.dispatch({ type: 'hubs/upsert', hub: msg.body.hub })
+    showToast(`Hub "${msg.body.hub.name}" created successfully`)
+    if (dom.createHubModal && dom.createHubModal.close) dom.createHubModal.close()
+  }
+}
+
+const handleHubUpdated = (msg) => {
+  const hubIndex = state.hubs.findIndex((hub) => hub.hub_id === msg.body.hub.hub_id)
+  if (hubIndex !== -1) {
+    store.dispatch({ type: 'hubs/upsert', hub: msg.body.hub })
+    showToast(`Hub renamed to "${msg.body.hub.name}"`)
+  }
+}
+
+const handleHubDeleted = (msg) => {
+  applyHubDeleted(msg.body || {})
+  showToast('Hub deleted')
+}
+
+const handleChannelMemberEvent = (msg) => {
+  if (msg.body?.kind === 'join' && msg.body?.target_user_id === state.user?.user_id) {
+    if (msg.body?.channel_id === state.currentChannelId) {
+      send('msg.list', { channel_id: state.currentChannelId, after_seq: 0, limit: 200 })
+    }
+  }
+}
+
+const handleChannelCreated = (msg) => {
+  const exists = state.channels.some((channel) => channel.channel_id === msg.body.channel.channel_id)
+  if (!exists) {
+    store.dispatch({ type: 'channels/upsert', channel: msg.body.channel })
+    if (msg.reply_to) {
+      setActiveChannel(msg.body.channel.channel_id)
+    }
+  }
+}
+
+const handleChannelUpdated = (msg) => {
+  const channelIndex = state.channels.findIndex((channel) => channel.channel_id === msg.body.channel.channel_id)
+  if (channelIndex !== -1) {
+    store.dispatch({ type: 'channels/upsert', channel: msg.body.channel })
+    if (msg.body.channel.channel_id === state.currentChannelId) {
+      dom.activeRoom.textContent = msg.body.channel.name
+      updateChannelLayoutMode()
+      ensureVoiceStateForChannel(state.currentChannelId)
+      callStateService.markUpdated('channel.updated')
+    }
+    showToast(`Channel renamed to "${msg.body.channel.name}"`)
+  }
+}
+
+const handleChannelDeleted = (msg) => {
+  applyChannelDeleted(msg.body || {})
+  showToast('Channel deleted')
+}
+
+const handleChannelAdded = (msg) => {
+  const existingChannel = state.channels.find((channel) => channel.channel_id === msg.body.channel_id)
+  if (!existingChannel) {
+    store.dispatch({ type: 'channels/upsert', channel: msg.body })
+    showToast(`Added to channel: ${msg.body.name}`)
+  }
+}
+
+const handleUserSearchResult = (msg) => {
+  const users = msg.body.users || []
+  dom.memberSearchResults.innerHTML = users.map((user) => `
+      <div class='member-search-item' data-user-id='${user.user_id}'>
+        <span>${user.profile?.display_name || user.profile?.handle || user.user_id}</span>
+        <button class='add-user-btn' data-user-id='${user.user_id}'>Add</button>
+      </div>
+    `).join('')
+
+  dom.memberSearchResults.querySelectorAll('.add-user-btn').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const userId = btn.getAttribute('data-user-id')
+      send('channel.add_member', { channel_id: state.currentChannelId, target_user_id: userId })
+    })
+  })
+}
+
+const handleChannelMemberAdded = () => {
+  showToast('Member added successfully')
+  dom.addMemberModal.close()
+  dom.memberSearchInput.value = ''
+  dom.memberSearchResults.innerHTML = ''
+}
+
+const setupMessageSubscriptions = () => {
+  eventBus.on('ws:message:dispatch', ({ msg, markHandled }) => {
+    switch (msg.t) {
+      case 'hello_ack':
+        handleHelloAck(msg)
+        markHandled()
+        break
+      case 'auth.session':
+        handleAuthSession(msg)
+        markHandled()
+        break
+      case 'hub.list_result':
+        handleHubListResult(msg)
+        markHandled()
+        break
+      case 'channel.list_result':
+        handleChannelListResult(msg)
+        markHandled()
+        break
+      case 'admin.invite':
+        handleAdminInvite(msg)
+        markHandled()
+        break
+      case 'hub.created':
+        handleHubCreated(msg)
+        markHandled()
+        break
+      case 'hub.updated':
+        handleHubUpdated(msg)
+        markHandled()
+        break
+      case 'hub.deleted':
+        handleHubDeleted(msg)
+        markHandled()
+        break
+      case 'channel.member_event':
+        handleChannelMemberEvent(msg)
+        markHandled()
+        break
+      case 'channel.created':
+        handleChannelCreated(msg)
+        markHandled()
+        break
+      case 'channel.updated':
+        handleChannelUpdated(msg)
+        markHandled()
+        break
+      case 'channel.deleted':
+        handleChannelDeleted(msg)
+        markHandled()
+        break
+      case 'channel.added':
+        handleChannelAdded(msg)
+        markHandled()
+        break
+      case 'msg.event':
+        addMessage(msg.body.channel_id, msg.body.msg)
+        markHandled()
+        break
+      case 'msg.list_result':
+        store.dispatch({
+          type: 'messages/set',
+          channelId: msg.body.channel_id,
+          messages: msg.body.messages
+        })
+        cacheMessages(msg.body.channel_id)
+        markHandled()
+        break
+      case 'search.result':
+        store.dispatch({ type: 'search/set', hits: msg.body.hits || [] })
+        markHandled()
+        break
+      case 'rtc.call_event':
+        callStateService.mapSet(msg.body.channel_id, msg.body.call_id, 'rtc.call_event')
+        if (!state.callId && isVoiceChannel(state.currentChannelId) && state.currentChannelId === msg.body.channel_id) {
+          ensureVoiceStateForChannel(state.currentChannelId)
+        }
+        markHandled()
+        break
+      case 'rtc.call':
+        callStateService.setSession({
+          callId: msg.body.call_id,
+          callChannelId: msg.body.channel_id,
+          ice: msg.body.ice,
+          source: 'rtc.call'
+        })
+        send('rtc.join', { call_id: state.callId, peer_meta: { device: 'browser', capabilities: { screen: true } } })
+        markHandled()
+        break
+      case 'rtc.participants':
+        rtcInfo('[RTC] participants', {
+          callId: msg.body?.call_id,
+          selfPeerId: msg.body?.self_peer_id,
+          peerCount: (msg.body?.peers || []).length,
+          hasIce: Boolean(msg.body?.ice)
+        })
+        if (msg.body?.ice) {
+          callStateService.setSession({
+            ice: msg.body.ice,
+            selfPeerId: msg.body.self_peer_id,
+            source: 'rtc.participants'
+          })
+        } else {
+          callStateService.setSession({
+            selfPeerId: msg.body.self_peer_id,
+            source: 'rtc.participants'
+          })
+        }
+        ensurePeers(msg.body.peers || [])
+        if (state.voiceActive) {
+          startAudio()
+        }
+        markHandled()
+        break
+      case 'rtc.call_end': {
+        callStateService.mapDelete(msg.body.channel_id, 'rtc.call_end')
+        const matchesActiveCall = msg.body.call_id && state.callId && msg.body.call_id === state.callId
+        const matchesActiveChannel = msg.body.channel_id && state.callChannelId && msg.body.channel_id === state.callChannelId
+        if (matchesActiveCall || matchesActiveChannel) {
+          teardownCall()
+        }
+        markHandled()
+        break
+      }
+      case 'user.search_result':
+        handleUserSearchResult(msg)
+        markHandled()
+        break
+      case 'channel.member_added':
+        handleChannelMemberAdded(msg)
+        markHandled()
+        break
+      case 'error':
+        handleError(msg)
+        markHandled()
+        break
+      default:
+        break
+    }
+  })
+}
+
+const setupStoreSubscriptions = () => {
+  store.subscribe((event, payload) => {
+    switch (event) {
+      case 'auth:updated':
+        setAuthUi()
+        break
+      case 'hubs:updated':
+        renderHubs()
+        break
+      case 'channels:updated':
+        renderChannels()
+        break
+      case 'messages:updated':
+        if (payload?.channelId) {
+          renderMessages(payload.channelId)
+        }
+        break
+      case 'search:updated':
+        renderSearch(payload?.hits || [])
+        break
+      case 'call:updated':
+        updateCallControls()
+        break
+      default:
+        break
+    }
+  })
 }
 
 const isValidSdp = (value) => typeof value === 'string' && value.trim().startsWith('v=')
@@ -540,172 +787,28 @@ const summarizeSdpMedia = (sdp) => {
   return summary
 }
 
-/**
- * Handle incoming offer from peer
- * @param {Object} body - rtc.offer_event body
- */
-const handleOffer = async (body) => {
-  if (!isValidSdp(body?.sdp)) {
-    console.warn('Ignoring invalid rtc.offer_event SDP', body)
-    return
-  }
-  rtcInfo('[RTC] offer received', {
-    fromPeerId: body.from_peer_id,
-    callId: body.call_id,
-    media: summarizeSdpMedia(body.sdp)
-  })
-  const pc = createPeerConnection(body.from_peer_id, 'answerer')
-  const actor = state.peerConnections.get(body.from_peer_id)
-  if (!actor) {
-    rtcWarn('[RTC] offer ignored, missing peer actor', {
-      fromPeerId: body.from_peer_id,
-      callId: body.call_id
-    })
-    return
-  }
-  rtcInfo('[RTC] local tracks before attach', {
-    toPeerId: body.from_peer_id,
-    audioTracks: state.audioStream?.getAudioTracks().length || 0,
-    videoTracks: state.videoStream?.getVideoTracks().length || 0,
-    screenTracks: state.screenStream?.getVideoTracks().length || 0,
-    senderTracks: pc.getSenders().map((sender) => sender.track?.kind || 'none')
-  })
-  await actor.handle({ type: 'set-remote-offer', sdp: { type: 'offer', sdp: body.sdp } })
-  await attachLocalTracks(pc)
-  rtcInfo('[RTC] local tracks after attach', {
-    toPeerId: body.from_peer_id,
-    senderTracks: pc.getSenders().map((sender) => sender.track?.kind || 'none')
-  })
-  const pending = state.pendingIceByPeer.get(body.from_peer_id) || []
-  for (const candidate of pending) {
-    await actor.handle({ type: 'add-remote-ice', candidate })
-  }
-  state.pendingIceByPeer.delete(body.from_peer_id)
-  await actor.handle({ type: 'create-answer' })
-  const answer = actor.state.localSDP
-  if (!isValidSdp(answer?.sdp)) {
-    rtcWarn('[RTC] answer creation failed, invalid local SDP', {
-      toPeerId: body.from_peer_id,
-      callId: body.call_id
-    })
-    return
-  }
-  rtcInfo('[RTC] answer created', {
-    toPeerId: body.from_peer_id,
-    callId: body.call_id,
-    media: summarizeSdpMedia(answer.sdp)
-  })
-  send('rtc.answer', {
-    call_id: body.call_id,
-    to_peer_id: body.from_peer_id,
-    from_peer_id: state.selfPeerId,
-    sdp: answer.sdp
-  })
-}
+rtcCallService = new RtcCallService({
+  state,
+  send,
+  rtcInfo,
+  rtcWarn,
+  isValidSdp,
+  summarizeSdpMedia,
+  getOrCreateInboundStream: (event, peerId) => getOrCreateInboundStream(event, peerId),
+  ensureRemoteAudio: (stream, ownerPeerId) => ensureRemoteAudio(stream, ownerPeerId),
+  addStreamTile: (stream, label, isLocal, ownerPeerId) => addStreamTile(stream, label, isLocal, ownerPeerId),
+  removeStreamTile: (stream) => removeStreamTile(stream),
+  notifyStreamPublish: (streamId, kind, label, stream) => notifyStreamPublish(streamId, kind, label, stream),
+  updateCallControls: () => {
+    callStateService.markUpdated('rtc.service')
+  },
+  showToast
+})
 
-/**
- * Handle incoming answer from peer
- * @param {Object} body - rtc.answer_event body
- */
-const handleAnswer = async (body) => {
-  if (!isValidSdp(body?.sdp)) {
-    console.warn('Ignoring invalid rtc.answer_event SDP', body)
-    return
-  }
-  const actor = state.peerConnections.get(body.from_peer_id)
-  if (!actor) {
-    rtcWarn('[RTC] answer ignored, missing peer connection', {
-      fromPeerId: body.from_peer_id,
-      callId: body.call_id
-    })
-    return
-  }
-  if (!(actor instanceof OffererConnectionActor)) {
-    rtcWarn('[RTC] answer ignored, actor is not offerer', {
-      fromPeerId: body.from_peer_id,
-      callId: body.call_id
-    })
-    return
-  }
-  const pc = actor.pc
-  rtcInfo('[RTC] answer received', {
-    fromPeerId: body.from_peer_id,
-    callId: body.call_id,
-    media: summarizeSdpMedia(body.sdp)
-  })
-  await actor.handle({ type: 'set-remote-answer', sdp: { type: 'answer', sdp: body.sdp } })
-  const pending = state.pendingIceByPeer.get(body.from_peer_id) || []
-  for (const candidate of pending) {
-    await actor.handle({ type: 'add-remote-ice', candidate })
-  }
-  state.pendingIceByPeer.delete(body.from_peer_id)
-}
-
-/**
- * Handle incoming ICE candidate from peer
- * @param {Object} body - rtc.ice_event body
- */
-const handleIce = async (body) => {
-  const actor = state.peerConnections.get(body.from_peer_id)
-  if (!actor) {
-    if (body.candidate) {
-      const pending = state.pendingIceByPeer.get(body.from_peer_id) || []
-      pending.push(body.candidate)
-      state.pendingIceByPeer.set(body.from_peer_id, pending)
-      rtcInfo('[RTC] ICE queued, peer actor missing', {
-        fromPeerId: body.from_peer_id,
-        queued: pending.length
-      })
-    }
-    rtcWarn('[RTC] ICE deferred, missing peer connection', {
-      fromPeerId: body.from_peer_id,
-      callId: body.call_id
-    })
-    return
-  }
-  const pc = actor.pc
-  if (body.candidate) {
-    rtcInfo('[RTC] ICE received', {
-      fromPeerId: body.from_peer_id,
-      type: body.candidate.type || null,
-      hasRemoteDescription: Boolean(pc.remoteDescription)
-    })
-    if (!pc.remoteDescription) {
-      const pending = state.pendingIceByPeer.get(body.from_peer_id) || []
-      pending.push(body.candidate)
-      state.pendingIceByPeer.set(body.from_peer_id, pending)
-      rtcInfo('[RTC] ICE queued until remote description', {
-        fromPeerId: body.from_peer_id,
-        queued: pending.length
-      })
-      return
-    }
-    await actor.handle({ type: 'add-remote-ice', candidate: body.candidate })
-  }
-}
-
-/**
- * Handle peer join/leave events
- * @param {Object} body - rtc.peer_event body
- */
-const handlePeerEvent = (body) => {
-  if (body.kind === 'join' && body.peer?.peer_id && body.peer.peer_id !== state.selfPeerId) {
-    rtcInfo('[RTC] peer join event', {
-      peerId: body.peer.peer_id,
-      callId: body.call_id
-    })
-    // Only establish the peer connection here. The joining peer initiates offers
-    // from rtc.participants to avoid simultaneous offer glare.
-    createPeerConnection(body.peer.peer_id, 'answerer')
-  }
-  if (body.kind === 'leave' && body.peer?.peer_id) {
-    rtcInfo('[RTC] peer leave event', {
-      peerId: body.peer.peer_id,
-      callId: body.call_id
-    })
-    closePeer(body.peer.peer_id)
-  }
-}
+const handleOffer = async (body) => rtcCallService.handleOffer(body)
+const handleAnswer = async (body) => rtcCallService.handleAnswer(body)
+const handleIce = async (body) => rtcCallService.handleIce(body)
+const handlePeerEvent = (body) => rtcCallService.handlePeerEvent(body)
 
 /**
  * Message type dispatcher
@@ -717,182 +820,14 @@ const handlePeerEvent = (body) => {
  */
 
 const messageHandlers = {
-  hello_ack: (msg) => {
-    if (msg.body?.session?.authenticated) {
-      state.user = msg.body.session.user
-      state.sessionToken = msg.body.session.session_token || state.sessionToken
-      localStorage.setItem('session_token', state.sessionToken)
-      send('hub.list', {})
-      requestChannels()
-      setAuthUi()
-    } else {
-      setAuthUi()
-    }
-  },
-  'auth.session': handleAuthSession,
-  'admin.invite': (msg) => {
-    dom.adminInvite.value = msg.body.invite_token
-    dom.adminInviteSide.value = msg.body.invite_token
-  },
-  'hub.list_result': (msg) => {
-    state.hubs = msg.body.hubs || []
-    renderHubs()
-  },
-  'hub.created': (msg) => {
-    const exists = state.hubs.some(h => h.hub_id === msg.body.hub.hub_id)
-    if (!exists) {
-      state.hubs.push(msg.body.hub)
-      showToast(`Hub "${msg.body.hub.name}" created successfully`)
-      if (dom.createHubModal && dom.createHubModal.close) dom.createHubModal.close()
-      renderHubs()
-    }
-  },
-  'hub.updated': (msg) => {
-    const hubIndex = state.hubs.findIndex(h => h.hub_id === msg.body.hub.hub_id)
-    if (hubIndex !== -1) {
-      state.hubs[hubIndex] = msg.body.hub
-      renderHubs()
-      showToast(`Hub renamed to "${msg.body.hub.name}"`)
-    }
-  },
-  'hub.deleted': (msg) => {
-    applyHubDeleted(msg.body || {})
-    showToast('Hub deleted')
-  },
-  'channel.list_result': (msg) => {
-    state.channels = msg.body.channels || []
-    renderChannels()
-    if (!state.currentChannelId && state.channels.length > 0) {
-      setActiveChannel(state.channels[0].channel_id)
-    }
-    if (state.channels.length === 0 && state.user?.roles?.includes('admin')) {
-      send('channel.create', { hub_id: 'default', kind: 'text', name: 'general', visibility: 'public' })
-    }
-  },
-  'channel.member_event': (msg) => {
-    if (msg.body?.kind === 'join' && msg.body?.target_user_id === state.user?.user_id) {
-      if (msg.body?.channel_id === state.currentChannelId) {
-        send('msg.list', { channel_id: state.currentChannelId, after_seq: 0, limit: 200 })
-      }
-    }
-  },
-  'channel.created': (msg) => {
-    const exists = state.channels.some(c => c.channel_id === msg.body.channel.channel_id)
-    if (!exists) {
-      state.channels.push(msg.body.channel)
-      renderChannels()
-      // Only auto-activate when this client created the channel (reply_to present).
-      if (msg.reply_to) {
-        setActiveChannel(msg.body.channel.channel_id)
-      }
-    }
-  },
-  'channel.updated': (msg) => {
-    const channelIndex = state.channels.findIndex(c => c.channel_id === msg.body.channel.channel_id)
-    if (channelIndex !== -1) {
-      state.channels[channelIndex] = msg.body.channel
-      renderChannels()
-      if (msg.body.channel.channel_id === state.currentChannelId) {
-        dom.activeRoom.textContent = msg.body.channel.name
-        updateChannelLayoutMode()
-        ensureVoiceStateForChannel(state.currentChannelId)
-        updateCallControls()
-      }
-      showToast(`Channel renamed to "${msg.body.channel.name}"`)
-    }
-  },
-  'channel.deleted': (msg) => {
-    applyChannelDeleted(msg.body || {})
-    showToast('Channel deleted')
-  },
-  'channel.added': (msg) => {
-    const existingChannel = state.channels.find(c => c.channel_id === msg.body.channel_id)
-    if (!existingChannel) {
-      state.channels.push(msg.body)
-      renderChannels()
-      showToast(`Added to channel: ${msg.body.name}`)
-    }
-  },
-  'msg.event': (msg) => {
-    addMessage(msg.body.channel_id, msg.body.msg)
-  },
-  'msg.list_result': (msg) => {
-    state.messages.set(msg.body.channel_id, msg.body.messages)
-    renderMessages(msg.body.channel_id)
-    cacheMessages(msg.body.channel_id)
-  },
-  'search.result': (msg) => {
-    renderSearch(msg.body.hits || [])
-  },
-  'rtc.call_event': (msg) => {
-    state.channelCallMap.set(msg.body.channel_id, msg.body.call_id)
-    if (!state.callId && isVoiceChannel(state.currentChannelId) && state.currentChannelId === msg.body.channel_id) {
-      ensureVoiceStateForChannel(state.currentChannelId)
-    }
-    updateCallControls()
-  },
-  'rtc.call': (msg) => {
-    state.callId = msg.body.call_id
-    state.callChannelId = msg.body.channel_id
-    state.ice = msg.body.ice
-    send('rtc.join', { call_id: state.callId, peer_meta: { device: 'browser', capabilities: { screen: true } } })
-    updateCallControls()
-  },
-  'rtc.participants': (msg) => {
-    rtcInfo('[RTC] participants', {
-      callId: msg.body?.call_id,
-      selfPeerId: msg.body?.self_peer_id,
-      peerCount: (msg.body?.peers || []).length,
-      hasIce: Boolean(msg.body?.ice)
-    })
-    if (msg.body?.ice) {
-      state.ice = msg.body.ice
-    }
-    state.selfPeerId = msg.body.self_peer_id
-    ensurePeers(msg.body.peers || [])
-    if (state.voiceActive) {
-      startAudio()
-    }
-  },
+  // Most protocol events are now handled via event-bus subscriptions.
   'rtc.peer_event': (msg) => handlePeerEvent(msg.body || {}),
   'rtc.offer_event': (msg) => handleOffer(msg.body || {}),
   'rtc.answer_event': (msg) => handleAnswer(msg.body || {}),
   'rtc.ice_event': (msg) => handleIce(msg.body || {}),
   'rtc.stream_event': () => {
     // stream events are informational
-  },
-  'rtc.call_end': (msg) => {
-    state.channelCallMap.delete(msg.body.channel_id)
-    const matchesActiveCall = msg.body.call_id && state.callId && msg.body.call_id === state.callId
-    const matchesActiveChannel = msg.body.channel_id && state.callChannelId && msg.body.channel_id === state.callChannelId
-    if (matchesActiveCall || matchesActiveChannel) {
-      teardownCall()
-    }
-  },
-  'user.search_result': (msg) => {
-    const users = msg.body.users || []
-    dom.memberSearchResults.innerHTML = users.map(user => `
-      <div class='member-search-item' data-user-id='${user.user_id}'>
-        <span>${user.profile?.display_name || user.profile?.handle || user.user_id}</span>
-        <button class='add-user-btn' data-user-id='${user.user_id}'>Add</button>
-      </div>
-    `).join('')
-    
-    // Add click listeners to "Add" buttons
-    dom.memberSearchResults.querySelectorAll('.add-user-btn').forEach(btn => {
-      btn.addEventListener('click', () => {
-        const userId = btn.getAttribute('data-user-id')
-        send('channel.add_member', { channel_id: state.currentChannelId, target_user_id: userId })
-      })
-    })
-  },
-  'channel.member_added': (msg) => {
-    showToast('Member added successfully')
-    dom.addMemberModal.close()
-    dom.memberSearchInput.value = ''
-    dom.memberSearchResults.innerHTML = ''
-  },
-  error: handleError
+  }
 }
 
 /**
@@ -900,9 +835,22 @@ const messageHandlers = {
  * @param {Object} msg - Message with type 't'
  */
 const handleMessage = (msg) => {
+  let handledBySubscription = false
+  eventBus.emit('ws:message:dispatch', {
+    msg,
+    markHandled: () => {
+      handledBySubscription = true
+    }
+  })
+  if (handledBySubscription) {
+    eventBus.emit('ws:message:handled', { type: msg?.t, raw: msg, via: 'subscription' })
+    return
+  }
+  eventBus.emit('ws:message:handled', { type: msg?.t, raw: msg })
   const handler = messageHandlers[msg.t]
   if (handler) {
     Promise.resolve(handler(msg)).catch((error) => {
+      eventBus.emit('ws:handler:error', { type: msg?.t, error })
       console.error('Client message handler failed', msg?.t, error)
       showToast('Realtime handler error. Retrying may help.')
     })
@@ -930,30 +878,29 @@ const applyHubDeleted = (body) => {
     state.channels.filter((channel) => channel.hub_id === hubId).map((channel) => channel.channel_id)
   )
 
-  state.hubs = state.hubs.filter((hub) => hub.hub_id !== hubId)
-  state.channels = state.channels.filter((channel) => channel.hub_id !== hubId)
+  store.dispatch({ type: 'hubs/remove', hubId })
+  store.dispatch({ type: 'channels/removeByHub', hubId })
 
   for (const channelId of removedChannelIds) {
-    state.messages.delete(channelId)
+    store.dispatch({ type: 'messages/deleteChannel', channelId })
     localStorage.removeItem(`channel:${channelId}:messages`)
   }
 
   if (state.currentChannelId && removedChannelIds.has(state.currentChannelId)) {
     const nextChannelId = state.channels[0]?.channel_id || null
-    state.currentChannelId = null
+    store.dispatch({ type: 'channels/setCurrent', channelId: null })
     if (nextChannelId) {
       setActiveChannel(nextChannelId)
     } else {
-      state.voiceActive = false
+      callStateService.setSession({ voiceActive: false, source: 'hub.deleted' })
       leaveCurrentVoiceCall()
       dom.activeRoom.textContent = 'No channel selected'
       dom.messages.innerHTML = ''
       updateChannelLayoutMode()
-      updateCallControls()
+      callStateService.markUpdated('hub.deleted')
     }
   }
 
-  renderChannels()
 }
 
 /**
@@ -966,31 +913,30 @@ const applyChannelDeleted = (body) => {
     return
   }
 
-  state.channels = state.channels.filter((channel) => channel.channel_id !== channelId)
-  state.messages.delete(channelId)
+  store.dispatch({ type: 'channels/remove', channelId })
+  store.dispatch({ type: 'messages/deleteChannel', channelId })
   localStorage.removeItem(`channel:${channelId}:messages`)
 
   if (state.currentChannelId === channelId) {
     const nextChannelId = state.channels[0]?.channel_id || null
-    state.currentChannelId = null
+    store.dispatch({ type: 'channels/setCurrent', channelId: null })
     if (nextChannelId) {
       setActiveChannel(nextChannelId)
     } else {
-      state.voiceActive = false
+      callStateService.setSession({ voiceActive: false, source: 'channel.deleted' })
       leaveCurrentVoiceCall()
       dom.activeRoom.textContent = 'No channel selected'
       dom.messages.innerHTML = ''
       updateChannelLayoutMode()
-      updateCallControls()
+      callStateService.markUpdated('channel.deleted')
     }
   }
 
-  renderChannels()
 }
 
 // Channel creation modal listeners (hoisted for use in renderHubs)
 function openCreateRoomModal(hubId = null) {
-  state.selectedHubIdForChannelCreation = hubId
+  clientStateService.setSelectedHubForChannelCreation(hubId)
   dom.modalRoomName.value = ''
   dom.modalRoomKind.value = 'text'
   dom.modalRoomVisibility.value = 'public'
@@ -1015,233 +961,13 @@ function openCreateRoomModal(hubId = null) {
   dom.modalRoomName.focus()
 }
 
-/**
- * Render channel list in sidebar
- */
-/**
- * Render hubs with nested channels
- */
 const renderHubs = () => {
-  dom.hubsList.innerHTML = ''
-  
-  if (state.hubs.length === 0) {
-    const emptyMsg = document.createElement('li')
-    emptyMsg.className = 'empty-message'
-    emptyMsg.textContent = 'No hubs yet. Create one!'
-    dom.hubsList.appendChild(emptyMsg)
-    return
-  }
-  
-  state.hubs.forEach(hub => {
-    const hubItem = document.createElement('li')
-    hubItem.className = 'hub-item'
-    
-    const hubHeader = document.createElement('div')
-    hubHeader.className = 'hub-header'
-    
-    const hubName = document.createElement('span')
-    hubName.className = 'hub-name'
-    hubName.textContent = hub.name
-    hubName.title = 'Double-click to edit'
-    
-    // Double-click to edit hub name
-    hubName.addEventListener('dblclick', (e) => {
-      e.stopPropagation()
-      startEditingHubName(hub, hubName)
-    })
-    
-    const addChannelBtn = document.createElement('button')
-    addChannelBtn.className = 'add-channel-btn'
-    addChannelBtn.textContent = '+'
-    addChannelBtn.title = `Add channel to ${hub.name}`
-    addChannelBtn.addEventListener('click', (e) => {
-      e.stopPropagation()
-      openCreateRoomModal(hub.hub_id)
-    })
-
-    const deleteHubBtn = document.createElement('button')
-    deleteHubBtn.className = 'add-channel-btn delete-btn'
-    deleteHubBtn.textContent = '🗑'
-    deleteHubBtn.title = `Delete hub ${hub.name}`
-    deleteHubBtn.setAttribute('aria-label', `Delete hub ${hub.name}`)
-    deleteHubBtn.addEventListener('click', (e) => {
-      e.stopPropagation()
-      const confirmed = window.confirm(`Delete hub "${hub.name}" and all its channels?`)
-      if (!confirmed) {
-        return
-      }
-      send('hub.delete', { hub_id: hub.hub_id })
-    })
-
-    const hubActions = document.createElement('div')
-    hubActions.className = 'hub-actions'
-    hubActions.appendChild(addChannelBtn)
-    hubActions.appendChild(deleteHubBtn)
-    
-    hubHeader.appendChild(hubName)
-    hubHeader.appendChild(hubActions)
-    hubItem.appendChild(hubHeader)
-    
-    // Get channels for this hub
-    const hubChannels = state.channels.filter(c => c.hub_id === hub.hub_id)
-    
-    if (hubChannels.length > 0) {
-      const channelsList = document.createElement('ul')
-      channelsList.className = 'channels-list'
-      
-      hubChannels.forEach(channel => {
-        const channelItem = document.createElement('li')
-        channelItem.className = 'channel-item'
-        // Always show an icon for clarity
-        const kindIcon = channel.kind === 'voice' ? '🔊' : '#'
-        const visibilityIcon = channel.visibility === 'public' ? '🌍' : '🔒'
-        const icon = `${kindIcon} ${visibilityIcon}`
-        channelItem.innerHTML = ''
-        const channelName = document.createElement('span')
-        channelName.textContent = `${icon} ${channel.name}`
-        channelName.title = 'Click to join, double-click to edit'
-        channelName.style.flex = '1'
-        if (channel.channel_id === state.currentChannelId) {
-          channelItem.classList.add('active')
-        }
-        // Distinguish single vs double click
-        let clickTimer = null
-        channelName.addEventListener('click', (e) => {
-          if (clickTimer) {
-            clearTimeout(clickTimer)
-            clickTimer = null
-            return
-          }
-          clickTimer = setTimeout(() => {
-            setActiveChannel(channel.channel_id)
-            clickTimer = null
-          }, 250)
-        })
-        channelName.addEventListener('dblclick', (e) => {
-          e.stopPropagation()
-          if (clickTimer) {
-            clearTimeout(clickTimer)
-            clickTimer = null
-          }
-          startEditingChannelName(channel, channelName, icon)
-        })
-        const deleteChannelBtn = document.createElement('button')
-        deleteChannelBtn.className = 'channel-delete-btn'
-        deleteChannelBtn.textContent = '🗑'
-        deleteChannelBtn.title = `Delete channel ${channel.name}`
-        deleteChannelBtn.setAttribute('aria-label', `Delete channel ${channel.name}`)
-        deleteChannelBtn.addEventListener('click', (e) => {
-          e.stopPropagation()
-          const confirmed = window.confirm(`Delete channel "${channel.name}"?`)
-          if (!confirmed) {
-            return
-          }
-          send('channel.delete', { channel_id: channel.channel_id })
-        })
-        channelItem.appendChild(channelName)
-        channelItem.appendChild(deleteChannelBtn)
-        channelsList.appendChild(channelItem)
-      })
-      
-      hubItem.appendChild(channelsList)
-    }
-    
-    dom.hubsList.appendChild(hubItem)
-  })
+  sidebarTreePresenter.render()
 }
 
-/**
- * Start editing a hub name inline
- * @param {Object} hub - Hub object
- * @param {HTMLElement} hubNameElement - Element containing hub name
- */
-const startEditingHubName = (hub, hubNameElement) => {
-  const originalName = hub.name
-  const input = document.createElement('input')
-  input.type = 'text'
-  input.value = originalName
-  input.className = 'inline-edit-input hub-edit-input'
-  
-  const saveEdit = () => {
-    const newName = input.value.trim()
-    if (newName && newName !== originalName) {
-      send('hub.update', { hub_id: hub.hub_id, name: newName })
-    }
-    hubNameElement.textContent = originalName
-    hubNameElement.style.display = ''
-    input.remove()
-  }
-  
-  const cancelEdit = () => {
-    hubNameElement.style.display = ''
-    input.remove()
-  }
-  
-  input.addEventListener('blur', saveEdit)
-  input.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter') {
-      e.preventDefault()
-      saveEdit()
-    } else if (e.key === 'Escape') {
-      e.preventDefault()
-      cancelEdit()
-    }
-  })
-  
-  hubNameElement.style.display = 'none'
-  hubNameElement.parentElement.insertBefore(input, hubNameElement)
-  input.focus()
-  input.select()
+const renderChannels = () => {
+  sidebarTreePresenter.render()
 }
-
-/**
- * Start editing a channel name inline
- * @param {Object} channel - Channel object
- * @param {HTMLElement} channelNameElement - Element containing channel name
- * @param {string} icon - Channel visibility icon
- */
-const startEditingChannelName = (channel, channelNameElement, icon) => {
-  const originalName = channel.name
-  const input = document.createElement('input')
-  input.type = 'text'
-  input.value = originalName
-  input.className = 'inline-edit-input channel-edit-input'
-  
-  const saveEdit = () => {
-    const newName = input.value.trim()
-    if (newName && newName !== originalName) {
-      send('channel.update', { channel_id: channel.channel_id, name: newName })
-    }
-    channelNameElement.textContent = `${icon} ${originalName}`
-    channelNameElement.style.display = ''
-    input.remove()
-  }
-  
-  const cancelEdit = () => {
-    channelNameElement.style.display = ''
-    input.remove()
-  }
-  
-  input.addEventListener('blur', saveEdit)
-  input.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter') {
-      e.preventDefault()
-      saveEdit()
-    } else if (e.key === 'Escape') {
-      e.preventDefault()
-      cancelEdit()
-    }
-  })
-  
-  channelNameElement.style.display = 'none'
-  channelNameElement.parentElement.insertBefore(input, channelNameElement)
-  console.info('Starting to edit channel name for channel:', channel, channelNameElement.parentElement)
-
-  input.focus()
-  input.select()
-}
-
-const renderChannels = renderHubs
 
 const leaveCurrentVoiceCall = () => {
   if (!state.callId) {
@@ -1260,9 +986,9 @@ const ensureVoiceStateForChannel = (channelId) => {
     return
   }
 
-  state.voiceActive = true
+  callStateService.setSession({ voiceActive: true, source: 'ensure_voice_state' })
   if (state.callId && state.callChannelId === channelId) {
-    updateCallControls()
+    callStateService.markUpdated('voice_channel_already_active')
     return
   }
 
@@ -1272,13 +998,16 @@ const ensureVoiceStateForChannel = (channelId) => {
 
   const existingCall = state.channelCallMap.get(channelId)
   if (existingCall) {
-    state.callId = existingCall
-    state.callChannelId = channelId
+    callStateService.setSession({
+      callId: existingCall,
+      callChannelId: channelId,
+      source: 'existing_call_join'
+    })
     send('rtc.join', { call_id: existingCall, peer_meta: { device: 'browser', capabilities: { screen: true } } })
   } else {
     send('rtc.call_create', { channel_id: channelId, kind: 'mesh', media: { audio: true, video: true } })
   }
-  updateCallControls()
+  callStateService.markUpdated('ensure_voice_state')
 }
 
 /**
@@ -1286,18 +1015,16 @@ const ensureVoiceStateForChannel = (channelId) => {
  * @param {string} channelId
  */
 const setActiveChannel = (channelId) => {
-  state.currentChannelId = channelId
+  store.dispatch({ type: 'channels/setCurrent', channelId })
   updateChannelLayoutMode()
   dom.activeRoom.textContent = state.channels.find((channel) => channel.channel_id === channelId)?.name || channelId
-  renderChannels()
   const cached = loadCachedMessages(channelId)
   if (cached) {
-    state.messages.set(channelId, cached)
-    renderMessages(channelId)
+    store.dispatch({ type: 'messages/set', channelId, messages: cached })
   }
   send('channel.join', { channel_id: channelId })
   ensureVoiceStateForChannel(channelId)
-  updateCallControls()
+  callStateService.markUpdated('active_channel')
   setSidebarMenuOpen(false)
 }
 
@@ -1307,13 +1034,7 @@ const setActiveChannel = (channelId) => {
  * @param {Object} msg - Message object
  */
 const addMessage = (channelId, msg) => {
-  if (!state.messages.has(channelId)) {
-    state.messages.set(channelId, [])
-  }
-  state.messages.get(channelId).push(msg)
-  if (channelId === state.currentChannelId) {
-    renderMessages(channelId)
-  }
+  store.dispatch({ type: 'messages/append', channelId, message: msg })
   cacheMessages(channelId)
 }
 
@@ -1322,25 +1043,7 @@ const addMessage = (channelId, msg) => {
  * @param {string} channelId
  */
 const renderMessages = (channelId) => {
-  if (channelId !== state.currentChannelId) {
-    return
-  }
-  const list = state.messages.get(channelId) || []
-  dom.messages.innerHTML = ''
-  list.forEach((msg) => {
-    const item = document.createElement('div')
-    item.className = 'message'
-    const meta = document.createElement('div')
-    meta.className = 'meta'
-    const handle = msg.user_handle || msg.user_id
-    meta.textContent = `${handle} · ${new Date(msg.ts).toLocaleTimeString()}`
-    const text = document.createElement('div')
-    text.textContent = msg.text
-    item.appendChild(meta)
-    item.appendChild(text)
-    dom.messages.appendChild(item)
-  })
-  dom.messages.scrollTop = dom.messages.scrollHeight
+  messagePresenter.renderMessages(channelId)
 }
 
 /**
@@ -1348,11 +1051,7 @@ const renderMessages = (channelId) => {
  * @param {Array<Object>} hits - Search hit results
  */
 const renderSearch = (hits) => {
-  if (!hits.length) {
-    dom.searchResults.textContent = 'No results'
-    return
-  }
-  dom.searchResults.textContent = hits.map((hit) => hit.snippet || hit.text).join(' | ')
+  messagePresenter.renderSearch(hits)
 }
 
 /**
@@ -1386,34 +1085,7 @@ const loadCachedMessages = (channelId) => {
  * Update UI state for voice call controls
  */
 const updateCallControls = () => {
-  const inVoiceChannel = isVoiceChannel(state.currentChannelId)
-  const inActiveVoiceCall = Boolean(state.callId && state.callChannelId === state.currentChannelId)
-
-  dom.startCallBtn.disabled = !inVoiceChannel || !inActiveVoiceCall
-  dom.toggleMediaBtn.disabled = !inActiveVoiceCall
-  dom.shareScreenBtn.disabled = !inActiveVoiceCall
-  dom.hangupCallBtn.disabled = !state.callId
-
-  dom.startCallBtn.textContent = state.micMuted ? '🔇' : '🎤'
-  dom.startCallBtn.title = state.micMuted ? 'Unmute microphone' : 'Mute microphone'
-  dom.toggleMediaBtn.textContent = state.videoStream ? '📕' : '📷'
-  dom.toggleMediaBtn.title = state.videoStream ? 'Turn camera off' : 'Turn camera on'
-  dom.shareScreenBtn.textContent = state.screenStream ? '🛑' : '🖥'
-  dom.shareScreenBtn.title = state.screenStream ? 'Stop screen share' : 'Start screen share'
-
-  if (!inVoiceChannel) {
-    dom.voiceHint.textContent = 'Select a voice channel to join live audio'
-  } else if (!inActiveVoiceCall) {
-    dom.voiceHint.textContent = 'Connecting to voice channel...'
-  } else {
-    dom.voiceHint.textContent = state.micMuted
-      ? 'In voice. You are muted'
-      : 'In voice. Mic is live'
-  }
-
-  if (dom.streamsEmpty) {
-    dom.streamsEmpty.classList.toggle('hidden', dom.streams.children.length > 0)
-  }
+  callControlsPresenter.render()
 }
 
 /**
@@ -1421,119 +1093,7 @@ const updateCallControls = () => {
  * @param {Array<Object>} peers
  */
 const ensurePeers = (peers) => {
-  peers.forEach((peer) => {
-    if (peer.peer_id === state.selfPeerId) {
-      return
-    }
-    createPeerConnection(peer.peer_id, 'offerer')
-    negotiatePeer(peer.peer_id)
-  })
-}
-
-/**
- * Build ICE server configuration from state
- * @returns {Array<Object>}
- */
-const buildIceServers = () => {
-  if (!state.ice) {
-    return []
-  }
-  const servers = []
-  if (state.ice.stun_urls?.length) {
-    servers.push({ urls: state.ice.stun_urls })
-  }
-  if (state.ice.turn_urls?.length) {
-    servers.push({ urls: state.ice.turn_urls, username: state.ice.turn_username, credential: state.ice.turn_credential })
-  }
-  return servers
-}
-
-const createPeerActor = (peerId, role = 'offerer') => {
-  const existing = state.peerConnections.get(peerId)
-  if (existing) {
-    const sameRole = (
-      (role === 'offerer' && existing instanceof OffererConnectionActor) ||
-      (role === 'answerer' && existing instanceof AnswererConnectionActor)
-    )
-    if (sameRole) {
-      return existing
-    }
-    closePeer(peerId)
-  }
-
-  const ActorClass = role === 'answerer' ? AnswererConnectionActor : OffererConnectionActor
-  const actor = new ActorClass({
-    onIceCandidate: (candidate) => {
-      rtcInfo('[RTC] local ICE candidate', {
-        toPeerId: peerId,
-        type: candidate.type || null
-      })
-      send('rtc.ice', {
-        call_id: state.callId,
-        to_peer_id: peerId,
-        from_peer_id: state.selfPeerId,
-        candidate
-      })
-    },
-    onStateChange: (connectionState) => {
-      const connState = connectionState?.connectionState
-      if (!connState) {
-        return
-      }
-      rtcInfo('[RTC] connection state', {
-        peerId,
-        state: connState
-      })
-      if (connState === 'failed' || connState === 'closed') {
-        closePeer(peerId)
-      }
-    }
-  }, {
-    rtcConfig: { iceServers: buildIceServers() }
-  })
-
-  actor.pc.addEventListener('track', (event) => {
-    const stream = getOrCreateInboundStream(event, peerId)
-    rtcInfo('[RTC] ontrack', {
-      peerId,
-      trackKind: event.track?.kind || null,
-      streamId: stream?.id || null,
-      videoTracks: stream?.getVideoTracks().length || 0,
-      audioTracks: stream?.getAudioTracks().length || 0
-    })
-    if (!stream) {
-      return
-    }
-    if (stream.getVideoTracks().length === 0) {
-      ensureRemoteAudio(stream, peerId)
-      return
-    }
-    addStreamTile(stream, `${peerId}`, false, peerId)
-    ensureRemoteAudio(stream, peerId)
-  })
-
-  actor.pc.addEventListener('iceconnectionstatechange', () => {
-    rtcInfo('[RTC] ice connection state', {
-      peerId,
-      state: actor.pc.iceConnectionState
-    })
-    if (actor.pc.iceConnectionState === 'failed' || actor.pc.iceConnectionState === 'closed') {
-      closePeer(peerId)
-    }
-  })
-
-  state.peerConnections.set(peerId, actor)
-  return actor
-}
-
-/**
- * Create or retrieve RTCPeerConnection for a peer
- * @param {string} peerId
- * @param {'offerer'|'answerer'} role
- * @returns {RTCPeerConnection}
- */
-const createPeerConnection = (peerId, role = 'offerer') => {
-  return createPeerActor(peerId, role).pc
+  rtcCallService.ensurePeers(peers)
 }
 
 /**
@@ -1543,177 +1103,9 @@ const createPeerConnection = (peerId, role = 'offerer') => {
  * @returns {MediaStream|null}
  */
 const getOrCreateInboundStream = (event, peerId) => {
-  const signaledStream = event.streams?.[0]
-  if (signaledStream) {
-    state.remoteInboundStreamsByPeer.set(peerId, signaledStream)
-    return signaledStream
-  }
-  if (!event.track) {
-    return null
-  }
-  const existing = state.remoteInboundStreamsByPeer.get(peerId)
-  if (existing) {
-    const hasTrack = existing.getTracks().some((track) => track.id === event.track.id)
-    if (!hasTrack) {
-      existing.addTrack(event.track)
-    }
-    return existing
-  }
-  const synthetic = new MediaStream([event.track])
-  state.remoteInboundStreamsByPeer.set(peerId, synthetic)
-  return synthetic
+  return resolveInboundStream(state, event, peerId)
 }
 
-/**
- * Ensure each peer connection can receive audio and video even before local capture starts.
- * @param {RTCPeerConnection} pc
- */
-const ensureRecvTransceivers = (pc) => {
-  const hasAudioReceiver = pc.getTransceivers().some((transceiver) => transceiver.receiver?.track?.kind === 'audio')
-  const hasVideoReceiver = pc.getTransceivers().some((transceiver) => transceiver.receiver?.track?.kind === 'video')
-  if (!hasAudioReceiver) {
-    pc.addTransceiver('audio', { direction: 'recvonly' })
-  }
-  if (!hasVideoReceiver) {
-    pc.addTransceiver('video', { direction: 'recvonly' })
-  }
-}
-
-const attachTrackToPeerConnection = async (pc, track, stream) => {
-  const hasTrack = pc.getSenders().some((sender) => sender.track?.id === track.id)
-  if (hasTrack) {
-    return
-  }
-
-  // Prefer reusing offered recvonly transceivers so answerers can actually send media.
-  const reusable = pc.getTransceivers().find((transceiver) => (
-    transceiver.receiver?.track?.kind === track.kind && !transceiver.sender?.track
-  ))
-
-  if (reusable?.sender) {
-    if (reusable.direction === 'recvonly') {
-      reusable.direction = 'sendrecv'
-    } else if (reusable.direction === 'inactive') {
-      reusable.direction = 'sendonly'
-    }
-    await reusable.sender.replaceTrack(track).catch(() => {
-      pc.addTrack(track, stream)
-    })
-    return
-  }
-
-  pc.addTrack(track, stream)
-}
-
-/**
- * Attach all active local media tracks to a peer connection
- * @param {RTCPeerConnection} pc
- */
-const attachLocalTracks = async (pc) => {
-  const desiredTracks = []
-  if (state.audioStream) {
-    desiredTracks.push(...state.audioStream.getTracks())
-  }
-  if (state.videoStream) {
-    desiredTracks.push(...state.videoStream.getTracks())
-  }
-  if (state.screenStream) {
-    desiredTracks.push(...state.screenStream.getTracks())
-  }
-  const desiredTrackIds = new Set(desiredTracks.map((track) => track.id))
-  const senderSync = []
-  pc.getSenders().forEach((sender) => {
-    const senderTrackId = sender.track?.id
-    if (!senderTrackId || desiredTrackIds.has(senderTrackId)) {
-      return
-    }
-    senderSync.push(sender.replaceTrack(null).catch(() => {}))
-    try {
-      pc.removeTrack(sender)
-    } catch (error) {
-      // ignore sender removal errors; renegotiation still proceeds
-    }
-  })
-  await Promise.all(senderSync)
-
-  const attachPromises = []
-  if (state.audioStream) {
-    state.audioStream.getTracks().forEach((track) => {
-      attachPromises.push(attachTrackToPeerConnection(pc, track, state.audioStream))
-    })
-  }
-  if (state.videoStream) {
-    state.videoStream.getTracks().forEach((track) => {
-      attachPromises.push(attachTrackToPeerConnection(pc, track, state.videoStream))
-    })
-  }
-  if (state.screenStream) {
-    state.screenStream.getTracks().forEach((track) => {
-      attachPromises.push(attachTrackToPeerConnection(pc, track, state.screenStream))
-    })
-  }
-  await Promise.all(attachPromises)
-}
-
-/**
- * Initiate offer negotiation with a peer
- * @param {string} peerId
- */
-const negotiatePeer = async (peerId) => {
-  const actor = createPeerActor(peerId, 'offerer')
-  const pc = actor.pc
-  ensureRecvTransceivers(pc)
-  await attachLocalTracks(pc)
-  rtcInfo('[RTC] creating offer', {
-    toPeerId: peerId,
-    senderTracks: pc.getSenders().map((sender) => sender.track?.kind || 'none')
-  })
-  await actor.handle({ type: 'create-offer' })
-  const offer = actor.state.localSDP
-  if (!isValidSdp(offer?.sdp)) {
-    rtcWarn('[RTC] offer creation failed, invalid local SDP', { toPeerId: peerId, callId: state.callId })
-    return
-  }
-  rtcInfo('[RTC] offer created', {
-    toPeerId: peerId,
-    callId: state.callId,
-    media: summarizeSdpMedia(offer.sdp)
-  })
-  send('rtc.offer', {
-    call_id: state.callId,
-    to_peer_id: peerId,
-    from_peer_id: state.selfPeerId,
-    sdp: offer.sdp
-  })
-}
-
-/**
- * Close and remove peer connection
- * @param {string} peerId
- */
-const closePeer = (peerId) => {
-  const actor = state.peerConnections.get(peerId)
-  state.peerConnections.delete(peerId)
-  if (actor) {
-    actor.close()
-  }
-  state.remoteInboundStreamsByPeer.delete(peerId)
-
-  for (const [streamId, tile] of state.streamTiles.entries()) {
-    if (tile.dataset.peerId === peerId) {
-      tile.remove()
-      state.streamTiles.delete(streamId)
-    }
-  }
-  for (const [streamId, audioEl] of state.remoteAudioEls.entries()) {
-    if (audioEl.dataset.peerId === peerId) {
-      audioEl.srcObject = null
-      audioEl.remove()
-      state.remoteAudioEls.delete(streamId)
-    }
-  }
-  updateCallControls()
-}
 
 const ensureRemoteAudio = (stream, ownerPeerId) => {
   if (!stream.getAudioTracks().length) {
@@ -1871,7 +1263,7 @@ const addStreamTile = (stream, label, isLocal, ownerPeerId = null) => {
     pruneIfNoRenderableVideo()
   })
 
-  updateCallControls()
+  callStateService.markUpdated('stream_tile_added')
 }
 
 /**
@@ -1892,7 +1284,7 @@ const removeStreamTile = (stream) => {
       streamId: stream.id,
       tiles: state.streamTiles.size
     })
-    updateCallControls()
+    callStateService.markUpdated('stream_tile_removed')
   }
 }
 
@@ -1900,136 +1292,46 @@ const removeStreamTile = (stream) => {
  * Start audio capture (microphone)
  */
 const startAudio = async () => {
-  if (state.audioStream) {
-    return
-  }
-  try {
-    state.audioStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false })
-  } catch (error) {
-    state.micMuted = true
-    showToast('Microphone access was denied')
-    updateCallControls()
-    return
-  }
-  state.audioStream.getAudioTracks().forEach((track) => {
-    track.enabled = !state.micMuted
-  })
-  state.peerConnections.forEach((pc, peerId) => {
-    negotiatePeer(peerId)
-  })
-  updateCallControls()
+  await rtcCallService.startAudio()
 }
 
 /**
  * Stop audio capture
  */
 const stopAudio = () => {
-  if (!state.audioStream) {
-    return
-  }
-  state.audioStream.getTracks().forEach((track) => track.stop())
-  state.audioStream = null
-  state.micMuted = false
-  state.peerConnections.forEach((actor, peerId) => {
-    negotiatePeer(peerId)
-  })
-  updateCallControls()
+  rtcCallService.stopAudio()
 }
 
 const toggleMicMute = () => {
-  if (!state.callId || !state.audioStream) {
-    return
-  }
-  state.micMuted = !state.micMuted
-  state.audioStream.getAudioTracks().forEach((track) => {
-    track.enabled = !state.micMuted
-  })
-  updateCallControls()
+  rtcCallService.toggleMicMute()
 }
 
 /**
  * Start video capture (camera)
  */
 const startVideo = async () => {
-  if (state.videoStream) {
-    stopVideo()
-    return
-  }
-  try {
-    state.videoStream = await navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 360 }, audio: false })
-  } catch (error) {
-    showToast('Camera access was denied')
-    updateCallControls()
-    return
-  }
-  addStreamTile(state.videoStream, 'Camera', true, 'local')
-  notifyStreamPublish('cam', 'camera', 'Camera', state.videoStream)
-  state.peerConnections.forEach((pc, peerId) => {
-    negotiatePeer(peerId)
-  })
-  updateCallControls()
+  await rtcCallService.startVideo()
 }
 
 /**
  * Stop video capture
  */
 const stopVideo = () => {
-  if (!state.videoStream) {
-    return
-  }
-  state.videoStream.getTracks().forEach((track) => track.stop())
-  removeStreamTile(state.videoStream)
-  state.videoStream = null
-  state.peerConnections.forEach((actor, peerId) => {
-    negotiatePeer(peerId)
-  })
-  updateCallControls()
+  rtcCallService.stopVideo()
 }
 
 /**
  * Start screen capture for sharing
  */
 const startScreenShare = async () => {
-  if (state.screenStream) {
-    stopScreenShare()
-    return
-  }
-  if (!navigator.mediaDevices?.getDisplayMedia) {
-    showToast('Screen share is not supported on this device/browser')
-    return
-  }
-  try {
-    state.screenStream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: false })
-  } catch (error) {
-    showToast('Screen share was cancelled or denied')
-    updateCallControls()
-    return
-  }
-  addStreamTile(state.screenStream, 'Screen', true, 'local')
-  notifyStreamPublish('screen', 'screen', 'Screen', state.screenStream)
-  state.peerConnections.forEach((pc, peerId) => {
-    negotiatePeer(peerId)
-  })
-  updateCallControls()
-  state.screenStream.getVideoTracks()[0].addEventListener('ended', () => {
-    stopScreenShare()
-  })
+  await rtcCallService.startScreenShare()
 }
 
 /**
  * Stop screen capture
  */
 const stopScreenShare = () => {
-  if (!state.screenStream) {
-    return
-  }
-  state.screenStream.getTracks().forEach((track) => track.stop())
-  removeStreamTile(state.screenStream)
-  state.screenStream = null
-  state.peerConnections.forEach((actor, peerId) => {
-    negotiatePeer(peerId)
-  })
-  updateCallControls()
+  rtcCallService.stopScreenShare()
 }
 
 /**
@@ -2059,27 +1361,7 @@ const notifyStreamPublish = (streamId, kind, label, stream) => {
  * Tear down all peer connections and media streams when leaving a call
  */
 const teardownCall = () => {
-  state.peerConnections.forEach((actor) => actor.close())
-  state.peerConnections.clear()
-  state.remoteAudioEls.forEach((audioEl) => {
-    audioEl.srcObject = null
-    audioEl.remove()
-  })
-  state.remoteAudioEls.clear()
-  state.remoteInboundStreamsByPeer.clear()
-  state.pendingIceByPeer.clear()
-  state.streamTilePruneTimers.forEach((timer) => window.clearTimeout(timer))
-  state.streamTilePruneTimers.clear()
-  state.streamTiles.forEach((tile) => tile.remove())
-  state.streamTiles.clear()
-  state.callId = null
-  state.callChannelId = null
-  state.selfPeerId = null
-  stopAudio()
-  stopVideo()
-  stopScreenShare()
-  state.voiceActive = false
-  updateCallControls()
+  rtcCallService.teardownCall()
 }
 
 /**
@@ -2180,9 +1462,7 @@ const setupEventListeners = () => {
   // Logout listener
   dom.logoutBtn.addEventListener('click', () => {
     localStorage.removeItem('session_token')
-    state.user = null
-    state.sessionToken = null
-    setAuthUi()
+    store.dispatch({ type: 'auth/set', user: null, sessionToken: null, source: 'logout' })
     showToast('Signed out')
   })
 
@@ -2237,7 +1517,7 @@ const setupEventListeners = () => {
 
   const closeCreateRoomModal = () => {
     dom.createRoomModal.close()
-    state.selectedHubIdForChannelCreation = null
+    clientStateService.setSelectedHubForChannelCreation(null)
   }
 
   const submitCreateRoom = () => {
@@ -2380,11 +1660,13 @@ const setupEventListeners = () => {
 }
 
 // Initialize app
+setupStoreSubscriptions()
+setupMessageSubscriptions()
 setupEventListeners()
 ensureRtcDebugPanel()
 if (rtcDebugEnabled) {
   rtcInfo('[RTC] debug session started', { href: location.href })
 }
-updateCallControls()
+callStateService.markUpdated('init')
 renderMobileDiagnostics()
 connect()
