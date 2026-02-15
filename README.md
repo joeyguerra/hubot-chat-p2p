@@ -94,3 +94,15 @@ An SFU centralizes media forwarding and adds complexity and resource cost. For a
 - Backup and restore for SQLite + attachments
 - P2P file attachments with server fallback
 - Presence enhancements and push-to-talk
+
+## If streaming isn't working for local dev, create a cert and serve up the site with https
+
+```sh
+openssl req -x509 -newkey rsa:2048 -sha256 -nodes -days 365 -keyout certs/dev-key.pem -out certs/dev-cert.pem -subj "/CN=joey-mini.local"
+```
+
+```sh
+HTTPS_CERT_FILE=./certs/dev-cert.pem HTTPS_KEY_FILE=./certs/dev-key.pem npm start
+```
+
+

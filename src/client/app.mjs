@@ -1,3 +1,5 @@
+import { AnswererConnectionActor, OffererConnectionActor } from './RtcConnector.mjs'
+
 /**
  * Centralized application state
  * @type {Object}
@@ -21,6 +23,7 @@ const state = {
   videoStream: null,
   screenStream: null,
   streamTiles: new Map(),
+  streamTilePruneTimers: new Map(),
   remoteAudioEls: new Map(),
   remoteInboundStreamsByPeer: new Map(),
   pendingIceByPeer: new Map(),
@@ -551,7 +554,15 @@ const handleOffer = async (body) => {
     callId: body.call_id,
     media: summarizeSdpMedia(body.sdp)
   })
-  const pc = createPeerConnection(body.from_peer_id)
+  const pc = createPeerConnection(body.from_peer_id, 'answerer')
+  const actor = state.peerConnections.get(body.from_peer_id)
+  if (!actor) {
+    rtcWarn('[RTC] offer ignored, missing peer actor', {
+      fromPeerId: body.from_peer_id,
+      callId: body.call_id
+    })
+    return
+  }
   rtcInfo('[RTC] local tracks before attach', {
     toPeerId: body.from_peer_id,
     audioTracks: state.audioStream?.getAudioTracks().length || 0,
@@ -559,7 +570,7 @@ const handleOffer = async (body) => {
     screenTracks: state.screenStream?.getVideoTracks().length || 0,
     senderTracks: pc.getSenders().map((sender) => sender.track?.kind || 'none')
   })
-  await pc.setRemoteDescription({ type: 'offer', sdp: body.sdp })
+  await actor.handle({ type: 'set-remote-offer', sdp: { type: 'offer', sdp: body.sdp } })
   await attachLocalTracks(pc)
   rtcInfo('[RTC] local tracks after attach', {
     toPeerId: body.from_peer_id,
@@ -567,11 +578,18 @@ const handleOffer = async (body) => {
   })
   const pending = state.pendingIceByPeer.get(body.from_peer_id) || []
   for (const candidate of pending) {
-    await pc.addIceCandidate(candidate)
+    await actor.handle({ type: 'add-remote-ice', candidate })
   }
   state.pendingIceByPeer.delete(body.from_peer_id)
-  const answer = await pc.createAnswer()
-  await pc.setLocalDescription(answer)
+  await actor.handle({ type: 'create-answer' })
+  const answer = actor.state.localSDP
+  if (!isValidSdp(answer?.sdp)) {
+    rtcWarn('[RTC] answer creation failed, invalid local SDP', {
+      toPeerId: body.from_peer_id,
+      callId: body.call_id
+    })
+    return
+  }
   rtcInfo('[RTC] answer created', {
     toPeerId: body.from_peer_id,
     callId: body.call_id,
@@ -594,23 +612,31 @@ const handleAnswer = async (body) => {
     console.warn('Ignoring invalid rtc.answer_event SDP', body)
     return
   }
-  const pc = state.peerConnections.get(body.from_peer_id)
-  if (!pc) {
+  const actor = state.peerConnections.get(body.from_peer_id)
+  if (!actor) {
     rtcWarn('[RTC] answer ignored, missing peer connection', {
       fromPeerId: body.from_peer_id,
       callId: body.call_id
     })
     return
   }
+  if (!(actor instanceof OffererConnectionActor)) {
+    rtcWarn('[RTC] answer ignored, actor is not offerer', {
+      fromPeerId: body.from_peer_id,
+      callId: body.call_id
+    })
+    return
+  }
+  const pc = actor.pc
   rtcInfo('[RTC] answer received', {
     fromPeerId: body.from_peer_id,
     callId: body.call_id,
     media: summarizeSdpMedia(body.sdp)
   })
-  await pc.setRemoteDescription({ type: 'answer', sdp: body.sdp })
+  await actor.handle({ type: 'set-remote-answer', sdp: { type: 'answer', sdp: body.sdp } })
   const pending = state.pendingIceByPeer.get(body.from_peer_id) || []
   for (const candidate of pending) {
-    await pc.addIceCandidate(candidate)
+    await actor.handle({ type: 'add-remote-ice', candidate })
   }
   state.pendingIceByPeer.delete(body.from_peer_id)
 }
@@ -620,14 +646,24 @@ const handleAnswer = async (body) => {
  * @param {Object} body - rtc.ice_event body
  */
 const handleIce = async (body) => {
-  const pc = state.peerConnections.get(body.from_peer_id)
-  if (!pc) {
-    rtcWarn('[RTC] ICE ignored, missing peer connection', {
+  const actor = state.peerConnections.get(body.from_peer_id)
+  if (!actor) {
+    if (body.candidate) {
+      const pending = state.pendingIceByPeer.get(body.from_peer_id) || []
+      pending.push(body.candidate)
+      state.pendingIceByPeer.set(body.from_peer_id, pending)
+      rtcInfo('[RTC] ICE queued, peer actor missing', {
+        fromPeerId: body.from_peer_id,
+        queued: pending.length
+      })
+    }
+    rtcWarn('[RTC] ICE deferred, missing peer connection', {
       fromPeerId: body.from_peer_id,
       callId: body.call_id
     })
     return
   }
+  const pc = actor.pc
   if (body.candidate) {
     rtcInfo('[RTC] ICE received', {
       fromPeerId: body.from_peer_id,
@@ -644,7 +680,7 @@ const handleIce = async (body) => {
       })
       return
     }
-    await pc.addIceCandidate(body.candidate)
+    await actor.handle({ type: 'add-remote-ice', candidate: body.candidate })
   }
 }
 
@@ -660,7 +696,7 @@ const handlePeerEvent = (body) => {
     })
     // Only establish the peer connection here. The joining peer initiates offers
     // from rtc.participants to avoid simultaneous offer glare.
-    createPeerConnection(body.peer.peer_id)
+    createPeerConnection(body.peer.peer_id, 'answerer')
   }
   if (body.kind === 'leave' && body.peer?.peer_id) {
     rtcInfo('[RTC] peer leave event', {
@@ -1389,7 +1425,7 @@ const ensurePeers = (peers) => {
     if (peer.peer_id === state.selfPeerId) {
       return
     }
-    createPeerConnection(peer.peer_id)
+    createPeerConnection(peer.peer_id, 'offerer')
     negotiatePeer(peer.peer_id)
   })
 }
@@ -1412,31 +1448,51 @@ const buildIceServers = () => {
   return servers
 }
 
-/**
- * Create or retrieve RTCPeerConnection for a peer
- * @param {string} peerId
- * @returns {RTCPeerConnection}
- */
-const createPeerConnection = (peerId) => {
-  if (state.peerConnections.has(peerId)) {
-    return state.peerConnections.get(peerId)
+const createPeerActor = (peerId, role = 'offerer') => {
+  const existing = state.peerConnections.get(peerId)
+  if (existing) {
+    const sameRole = (
+      (role === 'offerer' && existing instanceof OffererConnectionActor) ||
+      (role === 'answerer' && existing instanceof AnswererConnectionActor)
+    )
+    if (sameRole) {
+      return existing
+    }
+    closePeer(peerId)
   }
-  const pc = new RTCPeerConnection({ iceServers: buildIceServers() })
-  pc.onicecandidate = (event) => {
-    if (event.candidate) {
+
+  const ActorClass = role === 'answerer' ? AnswererConnectionActor : OffererConnectionActor
+  const actor = new ActorClass({
+    onIceCandidate: (candidate) => {
       rtcInfo('[RTC] local ICE candidate', {
         toPeerId: peerId,
-        type: event.candidate.type || null
+        type: candidate.type || null
       })
       send('rtc.ice', {
         call_id: state.callId,
         to_peer_id: peerId,
         from_peer_id: state.selfPeerId,
-        candidate: event.candidate
+        candidate
       })
+    },
+    onStateChange: (connectionState) => {
+      const connState = connectionState?.connectionState
+      if (!connState) {
+        return
+      }
+      rtcInfo('[RTC] connection state', {
+        peerId,
+        state: connState
+      })
+      if (connState === 'failed' || connState === 'closed') {
+        closePeer(peerId)
+      }
     }
-  }
-  pc.ontrack = (event) => {
+  }, {
+    rtcConfig: { iceServers: buildIceServers() }
+  })
+
+  actor.pc.addEventListener('track', (event) => {
     const stream = getOrCreateInboundStream(event, peerId)
     rtcInfo('[RTC] ontrack', {
       peerId,
@@ -1445,35 +1501,39 @@ const createPeerConnection = (peerId) => {
       videoTracks: stream?.getVideoTracks().length || 0,
       audioTracks: stream?.getAudioTracks().length || 0
     })
-    if (stream) {
-      if (stream.getVideoTracks().length === 0) {
-        ensureRemoteAudio(stream, peerId)
-        return
-      }
-      addStreamTile(stream, `${peerId}`, false, peerId)
+    if (!stream) {
+      return
+    }
+    if (stream.getVideoTracks().length === 0) {
       ensureRemoteAudio(stream, peerId)
+      return
     }
-  }
-  pc.onconnectionstatechange = () => {
-    rtcInfo('[RTC] connection state', {
-      peerId,
-      state: pc.connectionState
-    })
-    if (pc.connectionState === 'failed' || pc.connectionState === 'closed') {
-      closePeer(peerId)
-    }
-  }
-  pc.oniceconnectionstatechange = () => {
+    addStreamTile(stream, `${peerId}`, false, peerId)
+    ensureRemoteAudio(stream, peerId)
+  })
+
+  actor.pc.addEventListener('iceconnectionstatechange', () => {
     rtcInfo('[RTC] ice connection state', {
       peerId,
-      state: pc.iceConnectionState
+      state: actor.pc.iceConnectionState
     })
-    if (pc.iceConnectionState === 'failed' || pc.iceConnectionState === 'closed') {
+    if (actor.pc.iceConnectionState === 'failed' || actor.pc.iceConnectionState === 'closed') {
       closePeer(peerId)
     }
-  }
-  state.peerConnections.set(peerId, pc)
-  return pc
+  })
+
+  state.peerConnections.set(peerId, actor)
+  return actor
+}
+
+/**
+ * Create or retrieve RTCPeerConnection for a peer
+ * @param {string} peerId
+ * @param {'offerer'|'answerer'} role
+ * @returns {RTCPeerConnection}
+ */
+const createPeerConnection = (peerId, role = 'offerer') => {
+  return createPeerActor(peerId, role).pc
 }
 
 /**
@@ -1550,6 +1610,32 @@ const attachTrackToPeerConnection = async (pc, track, stream) => {
  * @param {RTCPeerConnection} pc
  */
 const attachLocalTracks = async (pc) => {
+  const desiredTracks = []
+  if (state.audioStream) {
+    desiredTracks.push(...state.audioStream.getTracks())
+  }
+  if (state.videoStream) {
+    desiredTracks.push(...state.videoStream.getTracks())
+  }
+  if (state.screenStream) {
+    desiredTracks.push(...state.screenStream.getTracks())
+  }
+  const desiredTrackIds = new Set(desiredTracks.map((track) => track.id))
+  const senderSync = []
+  pc.getSenders().forEach((sender) => {
+    const senderTrackId = sender.track?.id
+    if (!senderTrackId || desiredTrackIds.has(senderTrackId)) {
+      return
+    }
+    senderSync.push(sender.replaceTrack(null).catch(() => {}))
+    try {
+      pc.removeTrack(sender)
+    } catch (error) {
+      // ignore sender removal errors; renegotiation still proceeds
+    }
+  })
+  await Promise.all(senderSync)
+
   const attachPromises = []
   if (state.audioStream) {
     state.audioStream.getTracks().forEach((track) => {
@@ -1574,15 +1660,20 @@ const attachLocalTracks = async (pc) => {
  * @param {string} peerId
  */
 const negotiatePeer = async (peerId) => {
-  const pc = createPeerConnection(peerId)
+  const actor = createPeerActor(peerId, 'offerer')
+  const pc = actor.pc
   ensureRecvTransceivers(pc)
   await attachLocalTracks(pc)
   rtcInfo('[RTC] creating offer', {
     toPeerId: peerId,
     senderTracks: pc.getSenders().map((sender) => sender.track?.kind || 'none')
   })
-  const offer = await pc.createOffer()
-  await pc.setLocalDescription(offer)
+  await actor.handle({ type: 'create-offer' })
+  const offer = actor.state.localSDP
+  if (!isValidSdp(offer?.sdp)) {
+    rtcWarn('[RTC] offer creation failed, invalid local SDP', { toPeerId: peerId, callId: state.callId })
+    return
+  }
   rtcInfo('[RTC] offer created', {
     toPeerId: peerId,
     callId: state.callId,
@@ -1601,11 +1692,11 @@ const negotiatePeer = async (peerId) => {
  * @param {string} peerId
  */
 const closePeer = (peerId) => {
-  const pc = state.peerConnections.get(peerId)
-  if (pc) {
-    pc.close()
-  }
+  const actor = state.peerConnections.get(peerId)
   state.peerConnections.delete(peerId)
+  if (actor) {
+    actor.close()
+  }
   state.remoteInboundStreamsByPeer.delete(peerId)
 
   for (const [streamId, tile] of state.streamTiles.entries()) {
@@ -1720,26 +1811,65 @@ const addStreamTile = (stream, label, isLocal, ownerPeerId = null) => {
     tiles: state.streamTiles.size
   })
 
-  const cleanupIfEnded = () => {
-    const hasLiveVideo = stream.getVideoTracks().some((track) => track.readyState === 'live')
-    if (!hasLiveVideo) {
+  const hasRenderableVideo = () => {
+    return stream.getVideoTracks().some((track) => track.readyState === 'live' && !track.muted)
+  }
+
+  const clearPruneTimer = () => {
+    const existing = state.streamTilePruneTimers.get(stream.id)
+    if (!existing) {
+      return
+    }
+    window.clearTimeout(existing)
+    state.streamTilePruneTimers.delete(stream.id)
+  }
+
+  const pruneIfNoRenderableVideo = () => {
+    if (!hasRenderableVideo()) {
       removeStreamTile(stream)
     }
   }
+
+  const schedulePruneIfMuted = () => {
+    clearPruneTimer()
+    const timer = window.setTimeout(() => {
+      state.streamTilePruneTimers.delete(stream.id)
+      pruneIfNoRenderableVideo()
+    }, 1200)
+    state.streamTilePruneTimers.set(stream.id, timer)
+  }
+
   stream.getVideoTracks().forEach((track) => {
-    track.addEventListener('ended', cleanupIfEnded)
+    track.addEventListener('ended', pruneIfNoRenderableVideo)
+    track.addEventListener('mute', schedulePruneIfMuted)
+    track.addEventListener('unmute', () => {
+      clearPruneTimer()
+      if (!state.streamTiles.has(stream.id) && hasRenderableVideo()) {
+        addStreamTile(stream, label, isLocal, ownerPeerId)
+      }
+    })
   })
   stream.addEventListener('addtrack', (event) => {
     if (event.track?.kind === 'video') {
-      event.track.addEventListener('ended', cleanupIfEnded)
+      event.track.addEventListener('ended', pruneIfNoRenderableVideo)
+      event.track.addEventListener('mute', schedulePruneIfMuted)
+      event.track.addEventListener('unmute', () => {
+        clearPruneTimer()
+        if (!state.streamTiles.has(stream.id) && hasRenderableVideo()) {
+          addStreamTile(stream, label, isLocal, ownerPeerId)
+        }
+      })
     }
   })
   stream.addEventListener('removetrack', (event) => {
     if (!event.track || event.track.kind === 'video') {
-      cleanupIfEnded()
+      pruneIfNoRenderableVideo()
     }
   })
-  stream.addEventListener('inactive', cleanupIfEnded)
+  stream.addEventListener('inactive', () => {
+    clearPruneTimer()
+    pruneIfNoRenderableVideo()
+  })
 
   updateCallControls()
 }
@@ -1749,6 +1879,11 @@ const addStreamTile = (stream, label, isLocal, ownerPeerId = null) => {
  * @param {MediaStream} stream
  */
 const removeStreamTile = (stream) => {
+  const pruneTimer = state.streamTilePruneTimers.get(stream.id)
+  if (pruneTimer) {
+    window.clearTimeout(pruneTimer)
+    state.streamTilePruneTimers.delete(stream.id)
+  }
   const tile = state.streamTiles.get(stream.id)
   if (tile) {
     tile.remove()
@@ -1795,6 +1930,9 @@ const stopAudio = () => {
   state.audioStream.getTracks().forEach((track) => track.stop())
   state.audioStream = null
   state.micMuted = false
+  state.peerConnections.forEach((actor, peerId) => {
+    negotiatePeer(peerId)
+  })
   updateCallControls()
 }
 
@@ -1842,6 +1980,9 @@ const stopVideo = () => {
   state.videoStream.getTracks().forEach((track) => track.stop())
   removeStreamTile(state.videoStream)
   state.videoStream = null
+  state.peerConnections.forEach((actor, peerId) => {
+    negotiatePeer(peerId)
+  })
   updateCallControls()
 }
 
@@ -1885,6 +2026,9 @@ const stopScreenShare = () => {
   state.screenStream.getTracks().forEach((track) => track.stop())
   removeStreamTile(state.screenStream)
   state.screenStream = null
+  state.peerConnections.forEach((actor, peerId) => {
+    negotiatePeer(peerId)
+  })
   updateCallControls()
 }
 
@@ -1915,7 +2059,7 @@ const notifyStreamPublish = (streamId, kind, label, stream) => {
  * Tear down all peer connections and media streams when leaving a call
  */
 const teardownCall = () => {
-  state.peerConnections.forEach((pc) => pc.close())
+  state.peerConnections.forEach((actor) => actor.close())
   state.peerConnections.clear()
   state.remoteAudioEls.forEach((audioEl) => {
     audioEl.srcObject = null
@@ -1924,6 +2068,8 @@ const teardownCall = () => {
   state.remoteAudioEls.clear()
   state.remoteInboundStreamsByPeer.clear()
   state.pendingIceByPeer.clear()
+  state.streamTilePruneTimers.forEach((timer) => window.clearTimeout(timer))
+  state.streamTilePruneTimers.clear()
   state.streamTiles.forEach((tile) => tile.remove())
   state.streamTiles.clear()
   state.callId = null
