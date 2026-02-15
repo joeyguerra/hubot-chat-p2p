@@ -931,6 +931,52 @@ export class ChatServer {
       throw new ServiceError('FORBIDDEN', 'Not a member of channel')
     }
 
+    if (connection.peerId && connection.callId) {
+      const existingCall = this.signalingService.getCall(connection.callId)
+      const existingPeer = existingCall?.peers.get(connection.peerId)
+      if (connection.callId === call_id && existingPeer) {
+        this.send(connectionId, {
+          t: 'rtc.participants',
+          reply_to: msg.id,
+          ok: true,
+          body: {
+            call_id,
+            self_peer_id: connection.peerId,
+            ice: this.getIceConfig(),
+            peers: Array.from(existingCall.peers.values()).map((peer) => ({
+              peer_id: peer.peer_id,
+              user_id: peer.user_id
+            }))
+          }
+        })
+        return
+      }
+
+      this.peerConnections.delete(connection.peerId)
+      const leaveResult = this.signalingService.leaveCall({ callId: connection.callId, peerId: connection.peerId })
+      if (leaveResult.removed) {
+        this.broadcastCall(connection.callId, {
+          t: 'rtc.peer_event',
+          ok: true,
+          body: {
+            call_id: connection.callId,
+            kind: 'leave',
+            peer: { peer_id: connection.peerId, user_id: connection.userId }
+          }
+        })
+      }
+      if (leaveResult.ended && leaveResult.room_id) {
+        this.broadcastChannel(leaveResult.room_id, {
+          t: 'rtc.call_end',
+          ok: true,
+          body: {
+            call_id: connection.callId,
+            channel_id: leaveResult.room_id
+          }
+        })
+      }
+    }
+
     const result = this.signalingService.joinCall({ callId: call_id, userId: connection.userId })
     connection.peerId = result.peerId
     connection.callId = call_id
@@ -943,6 +989,7 @@ export class ChatServer {
       body: {
         call_id,
         self_peer_id: result.peerId,
+        ice: this.getIceConfig(),
         peers: result.peers
       }
     })

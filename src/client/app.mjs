@@ -22,7 +22,9 @@ const state = {
   screenStream: null,
   streamTiles: new Map(),
   remoteAudioEls: new Map(),
+  remoteInboundStreamsByPeer: new Map(),
   pendingIceByPeer: new Map(),
+  pendingAuthRequest: null,
   channelCallMap: new Map(),
   toastTimer: null,
   voiceActive: false,
@@ -30,6 +32,7 @@ const state = {
   micMuted: false,
   textChatDrawerOpen: false,
   reconnectTimer: null,
+  wsConnectTimer: null,
   reconnectAttempts: 0,
   lastSocketEvent: 'init',
   lastSocketError: ''
@@ -193,6 +196,7 @@ const wsReadyStateText = () => {
 }
 
 const renderMobileDiagnostics = () => {
+  return
   if (!dom.mobileDiagnostics) {
     return
   }
@@ -207,6 +211,77 @@ const renderMobileDiagnostics = () => {
     `retries: ${state.reconnectAttempts}`,
     state.lastSocketError ? `error: ${state.lastSocketError}` : ''
   ].filter(Boolean).join('\n')
+}
+
+const rtcDebugEnabled = new URLSearchParams(window.location.search).get('rtcdebug') === '1'
+let rtcDebugPanel = null
+
+const ensureRtcDebugPanel = () => {
+  if (!rtcDebugEnabled || rtcDebugPanel) {
+    return
+  }
+  const panel = document.createElement('pre')
+  panel.id = 'rtc-debug-panel'
+  panel.style.position = 'fixed'
+  panel.style.left = '8px'
+  panel.style.right = '8px'
+  panel.style.bottom = '8px'
+  panel.style.zIndex = '9999'
+  panel.style.maxHeight = '35vh'
+  panel.style.overflow = 'auto'
+  panel.style.margin = '0'
+  panel.style.padding = '8px'
+  panel.style.background = 'rgba(0, 0, 0, 0.85)'
+  panel.style.color = '#9df8a3'
+  panel.style.font = '11px/1.35 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace'
+  panel.style.border = '1px solid rgba(157, 248, 163, 0.4)'
+  panel.style.borderRadius = '8px'
+  panel.textContent = '[RTC] debug overlay enabled (?rtcdebug=1)\n'
+  document.body.appendChild(panel)
+  rtcDebugPanel = panel
+}
+
+const appendRtcDebugLine = (level, message, payload) => {
+  if (!rtcDebugEnabled) {
+    return
+  }
+  ensureRtcDebugPanel()
+  if (!rtcDebugPanel) {
+    return
+  }
+  const ts = new Date().toISOString().slice(11, 23)
+  let payloadText = ''
+  if (payload !== undefined) {
+    try {
+      payloadText = ` ${JSON.stringify(payload)}`
+    } catch (error) {
+      payloadText = ' [unserializable payload]'
+    }
+  }
+  rtcDebugPanel.textContent += `${ts} ${level} ${message}${payloadText}\n`
+  const lines = rtcDebugPanel.textContent.split('\n')
+  if (lines.length > 180) {
+    rtcDebugPanel.textContent = `${lines.slice(lines.length - 180).join('\n')}\n`
+  }
+  rtcDebugPanel.scrollTop = rtcDebugPanel.scrollHeight
+}
+
+const rtcInfo = (message, payload) => {
+  if (payload === undefined) {
+    console.info(message)
+  } else {
+    console.info(message, payload)
+  }
+  appendRtcDebugLine('INFO', message, payload)
+}
+
+const rtcWarn = (message, payload) => {
+  if (payload === undefined) {
+    console.warn(message)
+  } else {
+    console.warn(message, payload)
+  }
+  appendRtcDebugLine('WARN', message, payload)
 }
 
 /**
@@ -256,6 +331,39 @@ const setAuthUi = () => {
  * @param {string} messageType - Message type identifier
  * @param {Object} body - Message payload
  */
+const buildEnvelope = (messageType, body) => ({
+  v: 1,
+  t: messageType,
+  id: `${messageType}-${Date.now()}`,
+  ts: Date.now(),
+  body
+})
+
+const flushPendingAuthRequest = () => {
+  if (!state.ws || state.ws.readyState !== WebSocket.OPEN) {
+    return
+  }
+  if (!state.pendingAuthRequest) {
+    return
+  }
+  const pending = state.pendingAuthRequest
+  state.pendingAuthRequest = null
+  state.ws.send(JSON.stringify(buildEnvelope(pending.messageType, pending.body)))
+}
+
+const sendAuthRequest = (messageType, body) => {
+  if (state.ws && state.ws.readyState === WebSocket.OPEN) {
+    send(messageType, body)
+    return
+  }
+  state.pendingAuthRequest = { messageType, body }
+  connect()
+  const pendingMsg = 'Connecting... sign-in will be sent automatically'
+  dom.authHint.textContent = pendingMsg
+  dom.signinHint.textContent = pendingMsg
+  showToast(pendingMsg)
+}
+
 const send = (messageType, body) => {
   if (!state.ws || state.ws.readyState !== WebSocket.OPEN) {
     const message = 'Connection not ready. Please wait...'
@@ -264,7 +372,7 @@ const send = (messageType, body) => {
     showToast(message)
     return
   }
-  state.ws.send(JSON.stringify({ v: 1, t: messageType, id: `${messageType}-${Date.now()}`, ts: Date.now(), body }))
+  state.ws.send(JSON.stringify(buildEnvelope(messageType, body)))
 }
 
 const scheduleReconnect = () => {
@@ -282,6 +390,14 @@ const scheduleReconnect = () => {
   }, delayMs)
 }
 
+const clearWsConnectTimer = () => {
+  if (!state.wsConnectTimer) {
+    return
+  }
+  window.clearTimeout(state.wsConnectTimer)
+  state.wsConnectTimer = null
+}
+
 /**
  * Establish WebSocket connection to server
  */
@@ -295,8 +411,24 @@ const connect = () => {
   state.lastSocketEvent = 'connect_start'
   state.lastSocketError = ''
   setStatus('connecting')
+  clearWsConnectTimer()
+  state.wsConnectTimer = window.setTimeout(() => {
+    if (!state.ws || state.ws.readyState !== WebSocket.CONNECTING) {
+      return
+    }
+    state.lastSocketEvent = 'connect_timeout'
+    state.lastSocketError = 'socket open timed out after 10s'
+    setStatus('socket timeout')
+    try {
+      state.ws.close()
+    } catch (error) {
+      // ignore close errors during timeout recovery
+    }
+    scheduleReconnect()
+  }, 10000)
 
   state.ws.addEventListener('open', () => {
+    clearWsConnectTimer()
     state.reconnectAttempts = 0
     if (state.reconnectTimer) {
       window.clearTimeout(state.reconnectTimer)
@@ -308,15 +440,24 @@ const connect = () => {
       client: { name: 'hubot-chat-p2p-web', ver: '0.1.0', platform: 'browser' },
       resume: { session_token: state.sessionToken }
     })
+    flushPendingAuthRequest()
   })
 
-  state.ws.addEventListener('close', () => {
+  state.ws.addEventListener('close', (event) => {
+    clearWsConnectTimer()
     state.lastSocketEvent = 'close'
+    state.lastSocketError = `close ${event.code}${event.reason ? ` (${event.reason})` : ''}`
     setStatus('disconnected')
+    if (state.pendingAuthRequest) {
+      const pendingMsg = 'Still connecting... retrying websocket'
+      dom.authHint.textContent = pendingMsg
+      dom.signinHint.textContent = pendingMsg
+    }
     scheduleReconnect()
   })
 
   state.ws.addEventListener('error', () => {
+    clearWsConnectTimer()
     state.lastSocketEvent = 'error'
     state.lastSocketError = 'socket error'
     setStatus('socket error')
@@ -372,6 +513,30 @@ const handleError = (msg) => {
 
 const isValidSdp = (value) => typeof value === 'string' && value.trim().startsWith('v=')
 
+const summarizeSdpMedia = (sdp) => {
+  if (!isValidSdp(sdp)) {
+    return null
+  }
+  const lines = sdp.split(/\r?\n/)
+  const summary = {}
+  let currentKind = null
+  for (const line of lines) {
+    if (line.startsWith('m=')) {
+      if (line.startsWith('m=audio')) currentKind = 'audio'
+      else if (line.startsWith('m=video')) currentKind = 'video'
+      else currentKind = null
+      continue
+    }
+    if (!currentKind || !line.startsWith('a=')) {
+      continue
+    }
+    if (line === 'a=sendrecv' || line === 'a=sendonly' || line === 'a=recvonly' || line === 'a=inactive') {
+      summary[currentKind] = line.slice(2)
+    }
+  }
+  return summary
+}
+
 /**
  * Handle incoming offer from peer
  * @param {Object} body - rtc.offer_event body
@@ -381,8 +546,25 @@ const handleOffer = async (body) => {
     console.warn('Ignoring invalid rtc.offer_event SDP', body)
     return
   }
+  rtcInfo('[RTC] offer received', {
+    fromPeerId: body.from_peer_id,
+    callId: body.call_id,
+    media: summarizeSdpMedia(body.sdp)
+  })
   const pc = createPeerConnection(body.from_peer_id)
+  rtcInfo('[RTC] local tracks before attach', {
+    toPeerId: body.from_peer_id,
+    audioTracks: state.audioStream?.getAudioTracks().length || 0,
+    videoTracks: state.videoStream?.getVideoTracks().length || 0,
+    screenTracks: state.screenStream?.getVideoTracks().length || 0,
+    senderTracks: pc.getSenders().map((sender) => sender.track?.kind || 'none')
+  })
   await pc.setRemoteDescription({ type: 'offer', sdp: body.sdp })
+  await attachLocalTracks(pc)
+  rtcInfo('[RTC] local tracks after attach', {
+    toPeerId: body.from_peer_id,
+    senderTracks: pc.getSenders().map((sender) => sender.track?.kind || 'none')
+  })
   const pending = state.pendingIceByPeer.get(body.from_peer_id) || []
   for (const candidate of pending) {
     await pc.addIceCandidate(candidate)
@@ -390,6 +572,11 @@ const handleOffer = async (body) => {
   state.pendingIceByPeer.delete(body.from_peer_id)
   const answer = await pc.createAnswer()
   await pc.setLocalDescription(answer)
+  rtcInfo('[RTC] answer created', {
+    toPeerId: body.from_peer_id,
+    callId: body.call_id,
+    media: summarizeSdpMedia(answer.sdp)
+  })
   send('rtc.answer', {
     call_id: body.call_id,
     to_peer_id: body.from_peer_id,
@@ -409,8 +596,17 @@ const handleAnswer = async (body) => {
   }
   const pc = state.peerConnections.get(body.from_peer_id)
   if (!pc) {
+    rtcWarn('[RTC] answer ignored, missing peer connection', {
+      fromPeerId: body.from_peer_id,
+      callId: body.call_id
+    })
     return
   }
+  rtcInfo('[RTC] answer received', {
+    fromPeerId: body.from_peer_id,
+    callId: body.call_id,
+    media: summarizeSdpMedia(body.sdp)
+  })
   await pc.setRemoteDescription({ type: 'answer', sdp: body.sdp })
   const pending = state.pendingIceByPeer.get(body.from_peer_id) || []
   for (const candidate of pending) {
@@ -426,13 +622,26 @@ const handleAnswer = async (body) => {
 const handleIce = async (body) => {
   const pc = state.peerConnections.get(body.from_peer_id)
   if (!pc) {
+    rtcWarn('[RTC] ICE ignored, missing peer connection', {
+      fromPeerId: body.from_peer_id,
+      callId: body.call_id
+    })
     return
   }
   if (body.candidate) {
+    rtcInfo('[RTC] ICE received', {
+      fromPeerId: body.from_peer_id,
+      type: body.candidate.type || null,
+      hasRemoteDescription: Boolean(pc.remoteDescription)
+    })
     if (!pc.remoteDescription) {
       const pending = state.pendingIceByPeer.get(body.from_peer_id) || []
       pending.push(body.candidate)
       state.pendingIceByPeer.set(body.from_peer_id, pending)
+      rtcInfo('[RTC] ICE queued until remote description', {
+        fromPeerId: body.from_peer_id,
+        queued: pending.length
+      })
       return
     }
     await pc.addIceCandidate(body.candidate)
@@ -445,11 +654,19 @@ const handleIce = async (body) => {
  */
 const handlePeerEvent = (body) => {
   if (body.kind === 'join' && body.peer?.peer_id && body.peer.peer_id !== state.selfPeerId) {
+    rtcInfo('[RTC] peer join event', {
+      peerId: body.peer.peer_id,
+      callId: body.call_id
+    })
     // Only establish the peer connection here. The joining peer initiates offers
     // from rtc.participants to avoid simultaneous offer glare.
     createPeerConnection(body.peer.peer_id)
   }
   if (body.kind === 'leave' && body.peer?.peer_id) {
+    rtcInfo('[RTC] peer leave event', {
+      peerId: body.peer.peer_id,
+      callId: body.call_id
+    })
     closePeer(body.peer.peer_id)
   }
 }
@@ -464,7 +681,6 @@ const handlePeerEvent = (body) => {
  */
 
 const messageHandlers = {
-  error: handleError,
   hello_ack: (msg) => {
     if (msg.body?.session?.authenticated) {
       state.user = msg.body.session.user
@@ -532,7 +748,6 @@ const messageHandlers = {
       // Only auto-activate when this client created the channel (reply_to present).
       if (msg.reply_to) {
         setActiveChannel(msg.body.channel.channel_id)
-        send('channel.join', { channel_id: msg.body.channel.channel_id })
       }
     }
   },
@@ -588,6 +803,15 @@ const messageHandlers = {
     updateCallControls()
   },
   'rtc.participants': (msg) => {
+    rtcInfo('[RTC] participants', {
+      callId: msg.body?.call_id,
+      selfPeerId: msg.body?.self_peer_id,
+      peerCount: (msg.body?.peers || []).length,
+      hasIce: Boolean(msg.body?.ice)
+    })
+    if (msg.body?.ice) {
+      state.ice = msg.body.ice
+    }
     state.selfPeerId = msg.body.self_peer_id
     ensurePeers(msg.body.peers || [])
     if (state.voiceActive) {
@@ -603,7 +827,11 @@ const messageHandlers = {
   },
   'rtc.call_end': (msg) => {
     state.channelCallMap.delete(msg.body.channel_id)
-    teardownCall()
+    const matchesActiveCall = msg.body.call_id && state.callId && msg.body.call_id === state.callId
+    const matchesActiveChannel = msg.body.channel_id && state.callChannelId && msg.body.channel_id === state.callChannelId
+    if (matchesActiveCall || matchesActiveChannel) {
+      teardownCall()
+    }
   },
   'user.search_result': (msg) => {
     const users = msg.body.users || []
@@ -1196,6 +1424,10 @@ const createPeerConnection = (peerId) => {
   const pc = new RTCPeerConnection({ iceServers: buildIceServers() })
   pc.onicecandidate = (event) => {
     if (event.candidate) {
+      rtcInfo('[RTC] local ICE candidate', {
+        toPeerId: peerId,
+        type: event.candidate.type || null
+      })
       send('rtc.ice', {
         call_id: state.callId,
         to_peer_id: peerId,
@@ -1205,7 +1437,14 @@ const createPeerConnection = (peerId) => {
     }
   }
   pc.ontrack = (event) => {
-    const stream = event.streams[0]
+    const stream = getOrCreateInboundStream(event, peerId)
+    rtcInfo('[RTC] ontrack', {
+      peerId,
+      trackKind: event.track?.kind || null,
+      streamId: stream?.id || null,
+      videoTracks: stream?.getVideoTracks().length || 0,
+      audioTracks: stream?.getAudioTracks().length || 0
+    })
     if (stream) {
       if (stream.getVideoTracks().length === 0) {
         ensureRemoteAudio(stream, peerId)
@@ -1215,38 +1454,119 @@ const createPeerConnection = (peerId) => {
       ensureRemoteAudio(stream, peerId)
     }
   }
+  pc.onconnectionstatechange = () => {
+    rtcInfo('[RTC] connection state', {
+      peerId,
+      state: pc.connectionState
+    })
+    if (pc.connectionState === 'failed' || pc.connectionState === 'closed') {
+      closePeer(peerId)
+    }
+  }
+  pc.oniceconnectionstatechange = () => {
+    rtcInfo('[RTC] ice connection state', {
+      peerId,
+      state: pc.iceConnectionState
+    })
+    if (pc.iceConnectionState === 'failed' || pc.iceConnectionState === 'closed') {
+      closePeer(peerId)
+    }
+  }
   state.peerConnections.set(peerId, pc)
-  attachLocalTracks(pc)
   return pc
+}
+
+/**
+ * Get a remote stream from the event or synthesize one for streamless track events.
+ * @param {RTCTrackEvent} event
+ * @param {string} peerId
+ * @returns {MediaStream|null}
+ */
+const getOrCreateInboundStream = (event, peerId) => {
+  const signaledStream = event.streams?.[0]
+  if (signaledStream) {
+    state.remoteInboundStreamsByPeer.set(peerId, signaledStream)
+    return signaledStream
+  }
+  if (!event.track) {
+    return null
+  }
+  const existing = state.remoteInboundStreamsByPeer.get(peerId)
+  if (existing) {
+    const hasTrack = existing.getTracks().some((track) => track.id === event.track.id)
+    if (!hasTrack) {
+      existing.addTrack(event.track)
+    }
+    return existing
+  }
+  const synthetic = new MediaStream([event.track])
+  state.remoteInboundStreamsByPeer.set(peerId, synthetic)
+  return synthetic
+}
+
+/**
+ * Ensure each peer connection can receive audio and video even before local capture starts.
+ * @param {RTCPeerConnection} pc
+ */
+const ensureRecvTransceivers = (pc) => {
+  const hasAudioReceiver = pc.getTransceivers().some((transceiver) => transceiver.receiver?.track?.kind === 'audio')
+  const hasVideoReceiver = pc.getTransceivers().some((transceiver) => transceiver.receiver?.track?.kind === 'video')
+  if (!hasAudioReceiver) {
+    pc.addTransceiver('audio', { direction: 'recvonly' })
+  }
+  if (!hasVideoReceiver) {
+    pc.addTransceiver('video', { direction: 'recvonly' })
+  }
+}
+
+const attachTrackToPeerConnection = async (pc, track, stream) => {
+  const hasTrack = pc.getSenders().some((sender) => sender.track?.id === track.id)
+  if (hasTrack) {
+    return
+  }
+
+  // Prefer reusing offered recvonly transceivers so answerers can actually send media.
+  const reusable = pc.getTransceivers().find((transceiver) => (
+    transceiver.receiver?.track?.kind === track.kind && !transceiver.sender?.track
+  ))
+
+  if (reusable?.sender) {
+    if (reusable.direction === 'recvonly') {
+      reusable.direction = 'sendrecv'
+    } else if (reusable.direction === 'inactive') {
+      reusable.direction = 'sendonly'
+    }
+    await reusable.sender.replaceTrack(track).catch(() => {
+      pc.addTrack(track, stream)
+    })
+    return
+  }
+
+  pc.addTrack(track, stream)
 }
 
 /**
  * Attach all active local media tracks to a peer connection
  * @param {RTCPeerConnection} pc
  */
-const attachLocalTracks = (pc) => {
-  const existing = new Set(pc.getSenders().map((sender) => sender.track?.id).filter(Boolean))
+const attachLocalTracks = async (pc) => {
+  const attachPromises = []
   if (state.audioStream) {
     state.audioStream.getTracks().forEach((track) => {
-      if (!existing.has(track.id)) {
-        pc.addTrack(track, state.audioStream)
-      }
+      attachPromises.push(attachTrackToPeerConnection(pc, track, state.audioStream))
     })
   }
   if (state.videoStream) {
     state.videoStream.getTracks().forEach((track) => {
-      if (!existing.has(track.id)) {
-        pc.addTrack(track, state.videoStream)
-      }
+      attachPromises.push(attachTrackToPeerConnection(pc, track, state.videoStream))
     })
   }
   if (state.screenStream) {
     state.screenStream.getTracks().forEach((track) => {
-      if (!existing.has(track.id)) {
-        pc.addTrack(track, state.screenStream)
-      }
+      attachPromises.push(attachTrackToPeerConnection(pc, track, state.screenStream))
     })
   }
+  await Promise.all(attachPromises)
 }
 
 /**
@@ -1255,8 +1575,19 @@ const attachLocalTracks = (pc) => {
  */
 const negotiatePeer = async (peerId) => {
   const pc = createPeerConnection(peerId)
+  ensureRecvTransceivers(pc)
+  await attachLocalTracks(pc)
+  rtcInfo('[RTC] creating offer', {
+    toPeerId: peerId,
+    senderTracks: pc.getSenders().map((sender) => sender.track?.kind || 'none')
+  })
   const offer = await pc.createOffer()
   await pc.setLocalDescription(offer)
+  rtcInfo('[RTC] offer created', {
+    toPeerId: peerId,
+    callId: state.callId,
+    media: summarizeSdpMedia(offer.sdp)
+  })
   send('rtc.offer', {
     call_id: state.callId,
     to_peer_id: peerId,
@@ -1275,6 +1606,7 @@ const closePeer = (peerId) => {
     pc.close()
   }
   state.peerConnections.delete(peerId)
+  state.remoteInboundStreamsByPeer.delete(peerId)
 
   for (const [streamId, tile] of state.streamTiles.entries()) {
     if (tile.dataset.peerId === peerId) {
@@ -1320,6 +1652,17 @@ const ensureRemoteAudio = (stream, ownerPeerId) => {
   stream.getAudioTracks().forEach((track) => {
     track.addEventListener('ended', cleanupIfEnded)
   })
+  stream.addEventListener('addtrack', (event) => {
+    if (event.track?.kind === 'audio') {
+      event.track.addEventListener('ended', cleanupIfEnded)
+    }
+  })
+  stream.addEventListener('removetrack', (event) => {
+    if (!event.track || event.track.kind === 'audio') {
+      cleanupIfEnded()
+    }
+  })
+  stream.addEventListener('inactive', cleanupIfEnded)
 }
 
 /**
@@ -1345,6 +1688,11 @@ const addStreamTile = (stream, label, isLocal, ownerPeerId = null) => {
   }
 
   if (state.streamTiles.has(stream.id)) {
+    rtcInfo('[RTC] stream tile exists', {
+      streamId: stream.id,
+      ownerPeerId,
+      isLocal
+    })
     return
   }
   const tile = document.createElement('div')
@@ -1365,6 +1713,12 @@ const addStreamTile = (stream, label, isLocal, ownerPeerId = null) => {
   tile.appendChild(caption)
   dom.streams.appendChild(tile)
   state.streamTiles.set(stream.id, tile)
+  rtcInfo('[RTC] stream tile added', {
+    streamId: stream.id,
+    ownerPeerId,
+    isLocal,
+    tiles: state.streamTiles.size
+  })
 
   const cleanupIfEnded = () => {
     const hasLiveVideo = stream.getVideoTracks().some((track) => track.readyState === 'live')
@@ -1375,6 +1729,17 @@ const addStreamTile = (stream, label, isLocal, ownerPeerId = null) => {
   stream.getVideoTracks().forEach((track) => {
     track.addEventListener('ended', cleanupIfEnded)
   })
+  stream.addEventListener('addtrack', (event) => {
+    if (event.track?.kind === 'video') {
+      event.track.addEventListener('ended', cleanupIfEnded)
+    }
+  })
+  stream.addEventListener('removetrack', (event) => {
+    if (!event.track || event.track.kind === 'video') {
+      cleanupIfEnded()
+    }
+  })
+  stream.addEventListener('inactive', cleanupIfEnded)
 
   updateCallControls()
 }
@@ -1388,6 +1753,10 @@ const removeStreamTile = (stream) => {
   if (tile) {
     tile.remove()
     state.streamTiles.delete(stream.id)
+    rtcInfo('[RTC] stream tile removed', {
+      streamId: stream.id,
+      tiles: state.streamTiles.size
+    })
     updateCallControls()
   }
 }
@@ -1411,7 +1780,6 @@ const startAudio = async () => {
     track.enabled = !state.micMuted
   })
   state.peerConnections.forEach((pc, peerId) => {
-    attachLocalTracks(pc)
     negotiatePeer(peerId)
   })
   updateCallControls()
@@ -1449,11 +1817,16 @@ const startVideo = async () => {
     stopVideo()
     return
   }
-  state.videoStream = await navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 360 }, audio: false })
+  try {
+    state.videoStream = await navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 360 }, audio: false })
+  } catch (error) {
+    showToast('Camera access was denied')
+    updateCallControls()
+    return
+  }
   addStreamTile(state.videoStream, 'Camera', true, 'local')
   notifyStreamPublish('cam', 'camera', 'Camera', state.videoStream)
   state.peerConnections.forEach((pc, peerId) => {
-    attachLocalTracks(pc)
     negotiatePeer(peerId)
   })
   updateCallControls()
@@ -1480,11 +1853,20 @@ const startScreenShare = async () => {
     stopScreenShare()
     return
   }
-  state.screenStream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: false })
+  if (!navigator.mediaDevices?.getDisplayMedia) {
+    showToast('Screen share is not supported on this device/browser')
+    return
+  }
+  try {
+    state.screenStream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: false })
+  } catch (error) {
+    showToast('Screen share was cancelled or denied')
+    updateCallControls()
+    return
+  }
   addStreamTile(state.screenStream, 'Screen', true, 'local')
   notifyStreamPublish('screen', 'screen', 'Screen', state.screenStream)
   state.peerConnections.forEach((pc, peerId) => {
-    attachLocalTracks(pc)
     negotiatePeer(peerId)
   })
   updateCallControls()
@@ -1540,7 +1922,10 @@ const teardownCall = () => {
     audioEl.remove()
   })
   state.remoteAudioEls.clear()
+  state.remoteInboundStreamsByPeer.clear()
   state.pendingIceByPeer.clear()
+  state.streamTiles.forEach((tile) => tile.remove())
+  state.streamTiles.clear()
   state.callId = null
   state.callChannelId = null
   state.selfPeerId = null
@@ -1609,7 +1994,7 @@ const setupEventListeners = () => {
     }
 
     dom.authHint.textContent = 'Signing up...'
-    send('auth.invite_redeem', {
+    sendAuthRequest('auth.invite_redeem', {
       invite_token: inviteToken,
       profile: { handle, display_name: handle },
       password
@@ -1627,7 +2012,7 @@ const setupEventListeners = () => {
     }
 
     dom.signinHint.textContent = 'Signing in...'
-    send('auth.signin', { handle, password })
+    sendAuthRequest('auth.signin', { handle, password })
   })
 
   // Allow Enter key to submit in signup form
@@ -1850,6 +2235,10 @@ const setupEventListeners = () => {
 
 // Initialize app
 setupEventListeners()
+ensureRtcDebugPanel()
+if (rtcDebugEnabled) {
+  rtcInfo('[RTC] debug session started', { href: location.href })
+}
 updateCallControls()
 renderMobileDiagnostics()
 connect()
