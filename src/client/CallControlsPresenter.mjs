@@ -13,6 +13,9 @@ class CallControlsPresenter {
     this.dom.toggleMediaBtn.disabled = !inActiveVoiceCall
     this.dom.shareScreenBtn.disabled = !inActiveVoiceCall
     this.dom.hangupCallBtn.disabled = !this.state.callId
+    if (this.dom.editChannelBtn) {
+      this.dom.editChannelBtn.disabled = !this.state.currentChannelId
+    }
 
     this.dom.startCallBtn.textContent = this.state.micMuted ? '🔇' : '🎤'
     this.dom.startCallBtn.title = this.state.micMuted ? 'Unmute microphone' : 'Mute microphone'

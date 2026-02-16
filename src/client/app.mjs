@@ -54,6 +54,7 @@ const dom = {
   chatCard: qs('.chat'),
   mobileMenuBtn: qs('#mobile-menu-btn'),
   sidebar: qs('#sidebar-menu'),
+  sidebarResizer: qs('#sidebar-resizer'),
   sidebarOverlay: qs('#sidebar-overlay'),
   adminPanel: qs('#admin-panel'),
   hubsList: qs('#hubs-list'),
@@ -82,10 +83,12 @@ const dom = {
   shareScreenBtn: qs('#share-screen'),
   hangupCallBtn: qs('#hangup-call'),
   addMemberBtn: qs('#add-member'),
+  editChannelBtn: qs('#edit-channel-btn'),
   voiceHint: qs('#voice-hint'),
   roomNameInput: qs('#room-name'),
   roomKindSelect: qs('#room-kind'),
   createRoomModal: qs('#create-room-modal'),
+  channelModalTitle: qs('#channel-modal-title'),
   closeCreateRoomModalBtn: qs('#close-create-room-modal'),
   modalCancelBtn: qs('#modal-cancel'),
   modalCreateRoomBtn: qs('#modal-create-room'),
@@ -105,6 +108,10 @@ const dom = {
 }
 
 const MOBILE_SIDEBAR_BREAKPOINT = 900
+const SIDEBAR_WIDTH_STORAGE_KEY = 'ui.sidebar_width'
+const SIDEBAR_MIN_WIDTH = 220
+const SIDEBAR_MAX_WIDTH = 560
+const CENTER_MIN_WIDTH = 420
 let wsClient = null
 let rtcCallService = null
 let callControlsPresenter = null
@@ -114,11 +121,139 @@ let sidebarTreePresenter = null
 let messagePresenter = null
 let callStateService = null
 let clientStateService = null
+const channelModalState = {
+  mode: 'create',
+  channelId: null
+}
 
 const isMobileViewport = () => window.innerWidth <= MOBILE_SIDEBAR_BREAKPOINT
 
 const setSidebarMenuOpen = (isOpen) => {
   sidebarPresenter.setMenuOpen(isOpen, Boolean(state.user))
+}
+
+const clearSidebarWidth = () => {
+  if (!dom.layout) {
+    return
+  }
+  dom.layout.style.removeProperty('--sidebar-width')
+}
+
+const getSidebarWidthLimits = () => {
+  const viewportMax = window.innerWidth - CENTER_MIN_WIDTH
+  const max = Math.max(SIDEBAR_MIN_WIDTH, Math.min(SIDEBAR_MAX_WIDTH, viewportMax))
+  return { min: SIDEBAR_MIN_WIDTH, max }
+}
+
+const getCurrentSidebarWidth = () => {
+  if (!dom.layout || !dom.sidebar) {
+    return SIDEBAR_MIN_WIDTH
+  }
+  const fromStyle = Number.parseInt(dom.layout.style.getPropertyValue('--sidebar-width'), 10)
+  if (Number.isFinite(fromStyle)) {
+    return fromStyle
+  }
+  return Math.round(dom.sidebar.getBoundingClientRect().width) || SIDEBAR_MIN_WIDTH
+}
+
+const applySidebarWidth = (nextWidth, { persist = true } = {}) => {
+  if (!dom.layout) {
+    return
+  }
+  if (isMobileViewport()) {
+    clearSidebarWidth()
+    return
+  }
+  const { min, max } = getSidebarWidthLimits()
+  const clamped = Math.max(min, Math.min(max, Math.round(nextWidth)))
+  dom.layout.style.setProperty('--sidebar-width', `${clamped}px`)
+  if (persist) {
+    localStorage.setItem(SIDEBAR_WIDTH_STORAGE_KEY, String(clamped))
+  }
+}
+
+const setupSidebarResizer = () => {
+  if (!dom.sidebarResizer) {
+    return
+  }
+
+  const syncForViewport = () => {
+    if (isMobileViewport()) {
+      clearSidebarWidth()
+      return
+    }
+    applySidebarWidth(getCurrentSidebarWidth(), { persist: false })
+  }
+
+  const savedWidth = Number.parseInt(localStorage.getItem(SIDEBAR_WIDTH_STORAGE_KEY) || '', 10)
+  if (Number.isFinite(savedWidth)) {
+    applySidebarWidth(savedWidth, { persist: false })
+  } else {
+    syncForViewport()
+  }
+
+  let dragState = null
+  const finishDrag = () => {
+    dragState = null
+    dom.sidebarResizer.classList.remove('is-dragging')
+    document.body.classList.remove('sidebar-resizing')
+  }
+
+  dom.sidebarResizer.addEventListener('pointerdown', (event) => {
+    if (event.button !== 0 || isMobileViewport()) {
+      return
+    }
+    dragState = {
+      pointerId: event.pointerId,
+      startX: event.clientX,
+      startWidth: getCurrentSidebarWidth()
+    }
+    dom.sidebarResizer.classList.add('is-dragging')
+    document.body.classList.add('sidebar-resizing')
+    if (dom.sidebarResizer.setPointerCapture) {
+      dom.sidebarResizer.setPointerCapture(event.pointerId)
+    }
+    event.preventDefault()
+  })
+
+  dom.sidebarResizer.addEventListener('pointermove', (event) => {
+    if (!dragState || dragState.pointerId !== event.pointerId) {
+      return
+    }
+    const deltaX = event.clientX - dragState.startX
+    applySidebarWidth(dragState.startWidth + deltaX)
+  })
+
+  const pointerStop = (event) => {
+    if (!dragState || dragState.pointerId !== event.pointerId) {
+      return
+    }
+    if (dom.sidebarResizer.releasePointerCapture) {
+      try {
+        dom.sidebarResizer.releasePointerCapture(event.pointerId)
+      } catch (error) {
+        // ignore releasePointerCapture failures when pointer is already released
+      }
+    }
+    finishDrag()
+  }
+  dom.sidebarResizer.addEventListener('pointerup', pointerStop)
+  dom.sidebarResizer.addEventListener('pointercancel', pointerStop)
+  dom.sidebarResizer.addEventListener('lostpointercapture', finishDrag)
+
+  dom.sidebarResizer.addEventListener('keydown', (event) => {
+    if (isMobileViewport()) {
+      return
+    }
+    if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') {
+      return
+    }
+    const delta = event.key === 'ArrowLeft' ? -16 : 16
+    applySidebarWidth(getCurrentSidebarWidth() + delta)
+    event.preventDefault()
+  })
+
+  window.addEventListener('resize', syncForViewport)
 }
 
 const isVoiceChannel = (channelId) => store.isVoiceChannel(channelId)
@@ -936,6 +1071,14 @@ const applyChannelDeleted = (body) => {
 
 // Channel creation modal listeners (hoisted for use in renderHubs)
 function openCreateRoomModal(hubId = null) {
+  channelModalState.mode = 'create'
+  channelModalState.channelId = null
+  if (dom.channelModalTitle) {
+    dom.channelModalTitle.textContent = 'Create channel'
+  }
+  dom.modalCreateRoomBtn.textContent = 'Create'
+  dom.modalRoomKind.disabled = false
+  dom.modalRoomVisibility.disabled = false
   clientStateService.setSelectedHubForChannelCreation(hubId)
   dom.modalRoomName.value = ''
   dom.modalRoomKind.value = 'text'
@@ -957,6 +1100,47 @@ function openCreateRoomModal(hubId = null) {
   } else {
     dom.modalHubSelect.disabled = false
   }
+  dom.createRoomModal.showModal()
+  dom.modalRoomName.focus()
+}
+
+const openEditChannelModal = () => {
+  const channelId = state.currentChannelId
+  if (!channelId) {
+    showToast('Select a channel first')
+    return
+  }
+  const channel = state.channels.find((entry) => entry.channel_id === channelId)
+  if (!channel) {
+    showToast('Channel not found')
+    return
+  }
+
+  channelModalState.mode = 'edit'
+  channelModalState.channelId = channelId
+  if (dom.channelModalTitle) {
+    dom.channelModalTitle.textContent = 'Edit channel'
+  }
+  dom.modalCreateRoomBtn.textContent = 'Save changes'
+
+  clientStateService.setSelectedHubForChannelCreation(channel.hub_id || null)
+  dom.modalRoomName.value = channel.name || ''
+  dom.modalRoomKind.value = channel.kind || 'text'
+  dom.modalRoomVisibility.value = channel.visibility || 'public'
+  dom.modalHubSelect.innerHTML = '<option value="">Select a hub</option>'
+  state.hubs.forEach((hub) => {
+    const option = document.createElement('option')
+    option.value = hub.hub_id
+    option.textContent = hub.name
+    if (hub.hub_id === channel.hub_id) {
+      option.selected = true
+    }
+    dom.modalHubSelect.appendChild(option)
+  })
+  dom.modalHubSelect.disabled = true
+  dom.modalRoomKind.disabled = true
+  dom.modalRoomVisibility.disabled = true
+
   dom.createRoomModal.showModal()
   dom.modalRoomName.focus()
 }
@@ -995,6 +1179,9 @@ const ensureVoiceStateForChannel = (channelId) => {
   if (state.callId && state.callChannelId !== channelId) {
     leaveCurrentVoiceCall()
   }
+
+  // Voice sessions start muted by default until the user explicitly unmutes.
+  state.micMuted = true
 
   const existingCall = state.channelCallMap.get(channelId)
   if (existingCall) {
@@ -1368,6 +1555,8 @@ const teardownCall = () => {
  * Set up all event listeners for UI interactions
  */
 const setupEventListeners = () => {
+  setupSidebarResizer()
+
   dom.mobileMenuBtn.addEventListener('click', () => {
     setSidebarMenuOpen(!state.sidebarMenuOpen)
   })
@@ -1518,10 +1707,19 @@ const setupEventListeners = () => {
   const closeCreateRoomModal = () => {
     dom.createRoomModal.close()
     clientStateService.setSelectedHubForChannelCreation(null)
+    channelModalState.mode = 'create'
+    channelModalState.channelId = null
+    dom.modalRoomKind.disabled = false
+    dom.modalRoomVisibility.disabled = false
+    if (dom.channelModalTitle) {
+      dom.channelModalTitle.textContent = 'Create channel'
+    }
+    dom.modalCreateRoomBtn.textContent = 'Create'
   }
 
   const submitCreateRoom = () => {
     const name = dom.modalRoomName.value.trim()
+    const isEditMode = channelModalState.mode === 'edit'
     const kind = dom.modalRoomKind.value
     const visibility = dom.modalRoomVisibility.value
     const hubId = state.selectedHubIdForChannelCreation || dom.modalHubSelect.value
@@ -1530,12 +1728,22 @@ const setupEventListeners = () => {
       showToast('Please enter a channel name')
       return
     }
-    
+
+    if (isEditMode) {
+      if (!channelModalState.channelId) {
+        showToast('Channel not found')
+        return
+      }
+      send('channel.update', { channel_id: channelModalState.channelId, name })
+      closeCreateRoomModal()
+      return
+    }
+
     if (!hubId) {
       showToast('Please select a hub')
       return
     }
-    
+
     send('channel.create', { hub_id: hubId, kind, name, visibility })
     closeCreateRoomModal()
   }
@@ -1577,6 +1785,7 @@ const setupEventListeners = () => {
   }
 
   dom.addMemberBtn.addEventListener('click', openAddMemberModal)
+  dom.editChannelBtn.addEventListener('click', openEditChannelModal)
   dom.closeAddMemberModalBtn.addEventListener('click', closeAddMemberModal)
   dom.closeAddMemberBtn.addEventListener('click', closeAddMemberModal)
 

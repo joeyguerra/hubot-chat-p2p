@@ -2,7 +2,10 @@
 <html lang='en'>
   <head>
     <meta charset='utf-8'>
-    <meta name='viewport' content='width=device-width, initial-scale=1'>
+    <meta
+      name='viewport'
+      content='width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover'
+    >
     <title>hubot-chat-p2p</title>
     <link rel='stylesheet' href='/styles.css'>
   </head>
@@ -89,6 +92,12 @@
           </div>
 
         </aside>
+        <button
+          id='sidebar-resizer'
+          class='sidebar-resizer'
+          aria-label='Resize sidebar'
+          title='Drag to resize sidebar'
+        ></button>
         <button id='sidebar-overlay' class='sidebar-overlay' aria-label='Close hubs and channels menu'></button>
 
         <dialog id='create-hub-modal' class='modal'>
@@ -124,7 +133,7 @@
         <dialog id='create-room-modal' class='modal'>
           <div class='modal-content'>
             <div class='modal-header'>
-              <h2>Create channel</h2>
+              <h2 id='channel-modal-title'>Create channel</h2>
               <button id='close-create-room-modal' class='icon-btn close-btn' aria-label='Close'>×</button>
             </div>
             <div class='modal-body'>
@@ -191,6 +200,7 @@
               <button id='share-screen' class='icon-control voice-only' aria-label='Toggle screen share' title='Toggle screen share'>🖥</button>
               <button id='hangup-call'>Hang up</button>
               <button id='add-member'>Add member</button>
+              <button id='edit-channel-btn' class='icon-control' aria-label='Edit channel settings' title='Edit channel settings'>⚙</button>
             </div>
           </div>
           <div class='voice-hint' id='voice-hint'>Select a voice channel to auto-join with your mic</div>

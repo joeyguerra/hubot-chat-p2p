@@ -167,31 +167,14 @@ class SidebarTreePresenter {
 
           const channelName = document.createElement('span')
           channelName.textContent = `${icon} ${channel.name}`
-          channelName.title = 'Click to join, double-click to edit'
+          channelName.title = 'Click to join'
           channelName.style.flex = '1'
           if (channel.channel_id === this.state.currentChannelId) {
             channelItem.classList.add('active')
           }
 
-          let clickTimer = null
           channelName.addEventListener('click', () => {
-            if (clickTimer) {
-              clearTimeout(clickTimer)
-              clickTimer = null
-              return
-            }
-            clickTimer = setTimeout(() => {
-              this.onSetActiveChannel(channel.channel_id)
-              clickTimer = null
-            }, 250)
-          })
-          channelName.addEventListener('dblclick', (event) => {
-            event.stopPropagation()
-            if (clickTimer) {
-              clearTimeout(clickTimer)
-              clickTimer = null
-            }
-            this.startEditingChannelName(channel, channelName, icon)
+            this.onSetActiveChannel(channel.channel_id)
           })
 
           const deleteChannelBtn = document.createElement('button')
